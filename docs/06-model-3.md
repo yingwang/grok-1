@@ -2,7 +2,7 @@
 
 本章把 `model.py` 剩下的部分讲完：
 
-- `MHABlock`：把 attention 封装成"输入 -> 输出"的子层
+- `MHABlock`：把 attention 封装成"输入 → 输出"形式的子层
 - `DenseBlock`：单个 SwiGLU FFN（也是 MoE 的 layer_fn）
 - `DecoderLayer`：sandwich norm + MoE 选择
 - `LanguageModel` 与 `Transformer`：顶层组装
@@ -10,7 +10,7 @@
 - causal mask
 - KV cache 的接口
 
-读完这一章，你能完整在脑子里跑一遍 `forward(tokens) -> logits`。
+读完这一章，读者应当能够在头脑中完整还原一遍 `forward(tokens) -> logits` 的执行流程：从 token id 经由 embedding lookup 进入残差流，依次穿过 64 层 DecoderLayer，最后由 tied 的输出 embedding 投影回 logits。
 
 ## 6.1 `MHABlock`
 
@@ -62,11 +62,11 @@ class MHABlock(hk.Module):
         return attn_output._replace(embeddings=h_attn)
 ```
 
-这层只是个**自注意力包装** - `side_input = inputs` 让 query/key/value 都是同一个张量。可以理解为"self-attention block"的语法糖。
+这一层本质上只是一个**自注意力的封装**：通过 `side_input = inputs` 让 query、key、value 三个输入都指向同一个张量，可以理解为"self-attention block"的一种语法糖式写法。
 
-`@hk.transparent` 装饰器让这个 module 的参数 scope **不进入** Haiku 命名空间 - 也就是说 `MultiHeadAttention` 创建的参数名直接挂在父 module（DecoderLayer）下，不会变成 `mha_block/multi_head_attention/query/w`，而是 `decoder_layer_0/multi_head_attention/query/w`。
+`@hk.transparent` 装饰器的作用是让这个 module 的参数 scope **不进入** Haiku 的命名空间层级。也就是说，`MultiHeadAttention` 创建的参数名直接挂在父 module（DecoderLayer）下面，最终参数路径不会出现 `mha_block/multi_head_attention/query/w` 的形式，而是直接呈现为 `decoder_layer_0/multi_head_attention/query/w`。
 
-这种设计让 ckpt 的参数路径短一些，但代价是 `MHABlock` 不能被独立 init/apply。
+这种设计的好处是让 ckpt 中的参数路径更简短、更易读，代价则是 `MHABlock` 无法作为独立的 module 完成 init/apply。
 
 ## 6.2 `DenseBlock`：单专家的 FFN
 
@@ -129,11 +129,11 @@ $$
 
 这正好匹配 partition rules 里 `linear`、`linear_v`、`linear_1` 三个名字。
 
-`num_q_heads`、`num_kv_heads`、`key_size` 在 DenseBlock 里**完全没用**（构造参数里有，但 `__call__` 没读）- 这是从一个更大的 module 复制过来的残留代码，不影响功能。
+`num_q_heads`、`num_kv_heads`、`key_size` 这三个字段在 DenseBlock 内部**完全没有被使用**：它们出现在构造参数列表里，但 `__call__` 方法里没有任何地方读取它们。这看起来像是从一个更大的 module 复制过来时遗留的代码，不会影响功能正确性。
 
 ### 6.2.1 SwiGLU 还是 GeGLU？
 
-回到第 5 章的讨论 - 这里 `jax.nn.gelu`，是 **GELU**，所以严格来说是 **GeGLU**。但社区习惯都把这类 gated FFN 叫 SwiGLU，本书后文也偶尔用 SwiGLU 这个泛称。
+回到第 5 章中的讨论：这里用的是 `jax.nn.gelu`，激活函数是 **GELU**，所以严格按命名习惯来说应当称为 **GeGLU**。但社区在口语和文献里都习惯把这类 gated FFN 统称为 SwiGLU，本书后文也会沿用 SwiGLU 作为泛称。
 
 ## 6.3 `DecoderLayer`：sandwich norm 的真身
 
@@ -251,7 +251,7 @@ h_dense = layer_norm(h_dense)               # post-norm
 h += h_dense                                # residual add
 ```
 
-每个 sub-layer 用了**两次 RMSNorm**。所有 RMSNorm 调用都是 `hk_rms_norm(x)`，每次都会创建一个新的 RMSNorm module（按 Haiku 的命名规则，name 自动递增）。
+每个 sub-layer 实际使用了**两次 RMSNorm**。所有 RMSNorm 调用统一通过 `hk_rms_norm(x)` 完成，每一次调用都会创建一个新的 RMSNorm module 实例（按 Haiku 的默认命名规则，name 会自动递增）。
 
 按 `model.py:137-140` 的 partition rule：
 
@@ -282,9 +282,9 @@ Haiku 的命名规则是：每次创建同名 module，名字自动加后缀 `_1
 3. `rms_norm_2` (第三次)
 4. `rms_norm_3` (第四次)
 
-这要求**调用顺序固定** - 如果有 if 分支让某些调用被跳过，name 会错乱。Grok-1 的 DecoderLayer 没有这种分支（`if num_experts > 1` 只影响 MoE/DenseBlock，不影响 RMSNorm 调用），所以是安全的。
+这种命名机制要求**调用顺序保持固定**：如果存在 if 分支让某些 RMSNorm 调用被跳过，自动递增出来的 name 序号就会与预期错位。Grok-1 的 DecoderLayer 不存在这种条件分支（`if num_experts > 1` 只影响 MoE 与 DenseBlock 的分支选择，不影响 RMSNorm 调用次数），因此这套命名机制在当前代码下是安全的。
 
-但这种"靠隐式 name counter 维护参数命名"的风格比较 fragile。Flax 后来引入显式 name 必填的设计部分是为了避免这种陷阱。
+不过这种"依靠隐式 name counter 来维护参数命名"的风格比较 fragile。Flax 在后续版本中引入显式 name 必填的设计，一部分原因正是为了规避这类隐式计数带来的陷阱。
 
 ### 6.3.2 与传统 pre-norm / post-norm 的对比
 
@@ -312,7 +312,7 @@ y = x + LayerNorm(SubLayer(LayerNorm(x)))
 
 子层输入和输出都被 norm，残差量级被双重约束。代价：每层多一次 norm，参数多一倍。
 
-64 层在 pre-norm 下也未必爆炸，所以 Grok-1 选 sandwich 不是必需，可能是 xAI 经验上倾向更保守的设计。
+64 层这个深度在 pre-norm 设置下未必一定会出现残差爆炸，所以 Grok-1 选择 sandwich norm 并非数值稳定性上的必需选项，更可能反映出 xAI 团队在经验上偏向更保守的设计取向。
 
 ### 6.3.3 `if self.num_experts > 1` 分支
 
@@ -323,19 +323,19 @@ else:
     h_dense = base_dense_block(layer_norm(h))
 ```
 
-`num_experts = 8 > 1`，所以走 MoE 分支。但这个分支保留了 dense 路径，意味着可以用同一份代码训练 dense baseline - 这是研究友好的设计。
+由于 `num_experts = 8 > 1`，Grok-1 在实际推理时一定走 MoE 分支。但这个 if 分支同时保留了 dense 路径，意味着可以用完全相同的一份代码训练 dense baseline 模型，这是一种对研究使用比较友好的设计。
 
 ### 6.3.4 `with_sharding_constraint`
 
-每次 residual add 后都做一次 sharding constraint，把张量的 partition 显式约束到指定形状。当 `shard_activations=True`：
+每一次 residual add 完成之后，都会显式调用一次 sharding constraint，把张量的 partition 约束到指定的目标形状。在 `shard_activations=True` 的情况下：
 
 ```python
 sharding = P("data", None, "model")
 ```
 
-即 batch 沿 data 切、sequence 不切、hidden 沿 model 切。这是激活的"标准布局"。
+即 batch 维沿 data 轴切分、sequence 维保持不切、hidden 维沿 model 轴切分。这是激活值在 Grok-1 中的"标准布局"。
 
-XLA 编译时会用这些 constraint 决定通信策略 - 比如 attention 输出后 hidden 需要 all-gather 还是不需要。
+XLA 编译器会利用这些 sharding 约束来决定具体的通信策略，例如 attention 输出之后的 hidden 张量是否需要在 model 轴上进行 all-gather。
 
 ## 6.4 `Transformer`：64 层堆叠
 
@@ -405,29 +405,29 @@ def __call__(
 
 ### 6.4.0 数据流再总结
 
-`Transformer.__call__` 把整个主干串起来：
+`Transformer.__call__` 负责把整个 Transformer 主干串联起来：
 
-1. **构造 mask**：从 padding mask 和 causal mask 复合，得到 `[B, 1, T, T]` 的最终 mask
-2. **for 循环 64 层**：每层调用 DecoderLayer，传入当前 hidden、mask、padding_mask、上一步 KV memory
-3. **收集 KV memory**：每层输出新的 KVMemory，累积到 list
-4. **返回**：TransformerOutput(embeddings, Memory(layers=kv_memories))
+1. **构造 mask**：把 padding mask 与 causal mask 做逐元素相乘，得到形状为 `[B, 1, T, T]` 的最终 mask
+2. **for 循环跑 64 层**：每一层都调用一次 DecoderLayer，传入当前 hidden、合成 mask、padding mask、以及对应层的 KV memory
+3. **收集 KV memory**：每一层输出新的 KVMemory，逐层 append 到 list 中
+4. **返回**：把最终 hidden 与 64 层的 KV memory 一起打包为 TransformerOutput(embeddings, Memory(layers=kv_memories)) 返回
 
-注意第 1380 行 `decoder_output.embeddings` 是 64 层逐层更新的 hidden，第 1393 行 `kv_memories` 是 64 个独立的 KVMemory。两者结构平行但耦合 - 上一层的 KV memory 在下一层的同位置 DecoderLayer 内被用，但 hidden 是顺序传递。
+注意第 1380 行的 `decoder_output.embeddings` 表示 64 层之间逐层更新的 hidden，第 1393 行收集到的 `kv_memories` 则是 64 个相互独立的 KVMemory。两者在结构上是平行的，但实际计算中存在耦合：每一层在做 attention 时会用到该层自己的 KV memory，但 hidden 是顺序在层与层之间传递的。
 
 ### 6.4.1 Python for-loop 而非 `hk.scan`
 
-注意第 1380-1393 行用了 **Python for 循环**展开 64 层 - 不是 `hk.scan` 或 `jax.lax.scan`。
+注意第 1380-1393 行使用的是 **Python 原生 for 循环**来展开 64 层 DecoderLayer，并没有采用 `hk.scan` 或 `jax.lax.scan` 这种结构化的循环 primitive。
 
-这意味着：
+这种实现方式带来几个直接后果：
 
-1. **每一层的参数都独立存放**：`decoder_layer_0/...`、`decoder_layer_1/...`，64 个不同的 prefix
-2. **编译时 64 层全部 unroll** - XLA 看到的是一个超长的计算图
-3. **优点**：可以为每层加独立约束、独立调试，partition rules 可以匹配 `decoder_layer_[0-9]+` 这种正则
-4. **缺点**：编译时间长、占内存。Grok-1 实测 JIT compile 阶段会用几十 GB 内存
+1. **每一层的参数都被独立存放**，参数路径分别是 `decoder_layer_0/...`、`decoder_layer_1/...`，共 64 个不同的前缀
+2. **编译时 64 层全部被完全 unroll**，XLA 实际看到的是一张极长的、把全部 64 层串联展开的计算图
+3. **优点**：可以为每一层添加独立的 sharding 约束、独立调试单层行为，partition rules 也可以直接用 `decoder_layer_[0-9]+` 这种正则统一匹配
+4. **缺点**：编译时间长、内存占用大，Grok-1 实测在 JIT compile 阶段会消耗几十 GB 主机内存
 
-`hk.scan` 风格则会把 64 层折成一个 leading-64 维 - 参数 stack 在一起，编译只要看 1 层。Mixtral 用 PyTorch 写时是 for-loop，行为类似 Grok-1。
+如果改用 `hk.scan` 风格实现，则会把 64 层折叠成一个 leading-64 的维度，参数 stack 在一起，编译时实际只需要分析一层。Mixtral 在 PyTorch 实现中也是 for-loop 形式，整体行为与 Grok-1 类似。
 
-`partition_rules` 里特殊处理 `layer_stack`（`model.py:102-104`）暗示原本可能有 scan 版本，但当前代码用 for-loop。
+`partition_rules` 中针对 `layer_stack` 做了专门处理（见 `model.py:102-104`），这暗示代码早期版本中可能存在过基于 scan 的实现，但当前开源版本最终使用的是 for-loop 实现。
 
 ### 6.4.2 causal mask 构造
 
@@ -443,11 +443,11 @@ $$
 \text{mask}[i, j] = \mathbb{1}[\text{token}_j \neq \text{pad}] \cdot \mathbb{1}[j \le i]
 $$
 
-在 attention 计算里 mask = 0 的位置被设为 -1e30 然后 softmax 出 0。
+在 attention 的具体计算中，mask = 0 对应的位置会被赋成 -1e30，softmax 之后这些位置的注意力权重会被压到 0。
 
-注意 `seq_len` 是 prefill 时的整个 prompt 长度。在 decode 阶段 seq_len = 1，causal_mask 是个 `[1, 1, 1, 1]` 的全 1 矩阵 - 因为 decode 时只 attend 一个 query 到所有历史 K/V，causal mask 在 query 维度退化。
+注意 `seq_len` 指的是 prefill 阶段输入的整个 prompt 长度。在 decode 阶段 seq_len = 1，causal_mask 退化为 `[1, 1, 1, 1]` 的全 1 矩阵：decode 时只有一个 query 位置需要 attend 到所有历史 K/V，因此 causal mask 在 query 维度上失去了实际意义。
 
-但等等 - decode 阶段 K/V 长度是 8192（缓存全长）而非 1。这个 mask 是 `[B, 1, 1, 1]`，怎么对应到 K/V 长度？
+需要进一步澄清的是，decode 阶段实际的 K/V 序列长度是 8192（KV cache 的总长度），并不是 1。这里的 mask 形状是 `[B, 1, 1, 1]`，那它如何与长度为 8192 的 K/V 对应？
 
 答案在 `MultiHeadAttention.__call__` 里（`model.py:832-838`）：
 
@@ -461,7 +461,7 @@ else:
     mask = memory_mask
 ```
 
-`memory_mask` 是 `[B, 1, 1, 8192]`，"位置 < 当前 step" 的为 1。然后和外面传入的 causal mask 相乘。所以 decode 时实际 mask 是 memory_mask（causal mask 退化无效）。
+这里的 `memory_mask` 形状为 `[B, 1, 1, 8192]`，其语义是"位置序号小于当前 step"的位置取值为 1。它随后与外层传入的 causal mask 做逐元素相乘。因此在 decode 阶段，真正起作用的实际是 memory_mask，外层传入的 causal mask 在此时已经退化为全 1 失去筛选作用。
 
 ## 6.5 `LanguageModel`：加 embedding 与 logits
 
@@ -593,15 +593,15 @@ class InOutEmbed(hk.Embed):
 - 输入：`tokens` -> `embed_mat[tokens]`（继承自 `hk.Embed.__call__`）
 - 输出：`embeddings @ embed_mat.T`（`decode` 方法）
 
-**同一个 `embed_mat` 既做输入 embedding 又做输出 logits 投影。** 这是 tied embedding，节省 0.8B 参数。
+**同一个 `embed_mat` 既承担输入 token 的 embedding 查表，也用于输出 logits 的投影。** 这正是 tied embedding 的实现方式，对 Grok-1 这种 131072 词表、6144 隐藏维的模型来说可以节省大约 0.8B 参数。
 
-LLaMA-2 同样 tied，Mistral / Mixtral 也是。GPT-3 不 tied。Tied 还是 untied 的争论从 2017 开始就有，主流大模型 2023 之后基本都 tied。
+LLaMA-2 同样采用 tied embedding，Mistral 与 Mixtral 也都是 tied。GPT-3 选择 untied。tied 与 untied 的优劣讨论从 2017 年起就持续存在，但 2023 年之后主流大模型在工程取舍上几乎都倒向 tied 这一边。
 
 ### 6.5.2 `length` 参数：prefill 与 decode 都用
 
-在 prefill 时，`length` = 真实 prompt 长度（不含 pad）。代码会从 `[B, T_pad, d]` 中只取出位置 `length-1` 的那个 hidden，得到 `[B, 1, d]`，再过 decode 出 `[B, 1, V]`。
+在 prefill 阶段，`length` 表示真实的 prompt 长度（不含 pad）。代码会从形状为 `[B, T_pad, d]` 的 hidden 中按 `length-1` 索引取出每个 batch 元素对应的最后一个有效位置的 hidden，得到 `[B, 1, d]`，然后再过 decode 投影得到 `[B, 1, V]` 的 logits。
 
-这样在 prefill 阶段我们不需要计算 8192 个位置的 logits（浪费 8190 倍计算），只算最后一个。decode 阶段也用这个机制：传入 length=1，只取第 0 个位置。
+这样在 prefill 阶段就不必为 8192 个位置全部计算 logits（否则相对于实际需要的最后一个位置就是 8190 倍的浪费），只需要计算最后一个位置即可。decode 阶段沿用同样的机制：传入 length=1，只取序列的第 0 个位置作为 hidden。
 
 ## 6.6 KV cache 接口
 
@@ -652,13 +652,13 @@ bf16 dtype，每元素 2 bytes，per-layer per-batch：8M * 2 = 16M bytes / laye
 
 64 层 = **2.05 GB / batch**。
 
-这是 Grok-1 推理时除了模型权重外的主要显存开销。当 batch_size = 1，KV cache 就是 2 GB；batch_size = 8（mesh 8 卡，每卡 1 个 batch），共 16 GB KV cache。
+这是 Grok-1 推理时除模型权重之外最主要的显存开销。当 batch_size = 1 时 KV cache 大小约为 2 GB；当 batch_size = 8（mesh 8 卡，每卡承担 1 个 batch）时合计大约 16 GB。
 
-GQA 在这里救命 - 如果是 MHA（48 KV heads），KV cache 会变成 12 GB / batch。
+GQA 在这里起到了至关重要的显存压缩作用：如果改用 MHA（48 个 KV head），KV cache 会膨胀到大约 12 GB 每个 batch。
 
 ### 6.6.1 `step` 字段
 
-每个 batch 元素有独立的 step（`jnp.zeros(batch_size, dtype=jnp.int32)`）。这意味着不同 batch 元素可以处于不同的生成阶段 - 是为 continuous batching / 异步 serve 准备的。
+每个 batch 元素拥有各自独立的 step 计数（初始化为 `jnp.zeros(batch_size, dtype=jnp.int32)`）。这种设计允许同一 batch 中的不同元素处于不同的生成阶段，正是为 continuous batching 与异步 serving 场景准备的接口。
 
 `runners.py:73-74` 用 `jax.lax.dynamic_update_index_in_dim` 把新 batch 元素插入 cache：
 
@@ -685,22 +685,22 @@ def get_memory_sharding(self):
     )
 ```
 
-K/V partition 是 `(data, model)` - batch 沿 data 切，**第 1 维（seq_len）沿 model 切**。等等？seq_len 沿 model 切？
+K/V 的 partition 写成 `(data, model)`：batch 维沿 data 轴切分，**第 1 维（即 seq_len）沿 model 轴切分**。需要强调一下：seq_len 在这里是沿 model 轴切的。
 
-这有点反直觉。常规 KV cache sharding 是按 head 维度切（让每张卡持有部分 head）。Grok-1 按 seq_len 切意味着每张卡持有部分 token 位置的 K/V。8 卡，每卡持有 1024 个 token 位置的 K/V。
+这一点与常见做法有一定反差。常规的 KV cache sharding 方案是按 head 维度切（让每张卡持有部分 head 的 K/V）。Grok-1 按 seq_len 切意味着每张卡只持有 K/V 中部分 token 位置的数据。在 8 卡配置下，每张卡持有大约 1024 个 token 位置的 K/V。
 
 但 `model.py:826` 的 `update_into_shmap` partition spec 是 `P("data", None, "model")` - 第 0 维 batch 沿 data，第 1 维 seq_len 不切，第 2 维（head）沿 model。
 
-这两处 partition spec 不一致！可能的解释：
+这两处给出的 partition spec 看起来并不一致。一种合理的解释如下：
 
-- `get_memory_sharding` 给的 `(data, model)` 是 2D 的，对应 KV 的 4D shape 时只匹配前两维，后两维（head, key_size）默认按需切
-- `with_sharding_constraint(..., P("data", None, "model"))` 是 3D 的，匹配前三维
+- `get_memory_sharding` 中提供的 `(data, model)` 是 2D 形式，应用到 KV 这种 4D shape 时只匹配前两维，剩余的 head 与 key_size 维度按 JAX 默认行为推断
+- `with_sharding_constraint(..., P("data", None, "model"))` 是 3D 形式，匹配前三维
 
-JAX 的 PartitionSpec 是从前往后匹配，剩余维度 unconstrained。所以两处 spec **可以兼容** - `(data, model)` 等价于 `(data, model, None, None)`，而 `update_into_shmap` 用的 `(data, None, model)` 等价于 `(data, None, model, None)`。
+JAX 的 PartitionSpec 在匹配维度时是从前往后逐个对齐，未指定的后续维度默认 unconstrained。基于这条规则，两处 spec **是可以兼容的**：`(data, model)` 实际等价于 `(data, model, None, None)`，而 `update_into_shmap` 中使用的 `(data, None, model)` 等价于 `(data, None, model, None)`。
 
-两者关于 seq_len 维度的约束不一样 - 一个 model 切，一个不切。这可能是个 ckpt-vs-shmap 边界处理。XLA 编译器会自动插 reshard 让两端 spec 一致。
+两者对 seq_len 这一维的约束并不相同：一处是按 model 切，另一处是不切。这种不一致大概是 ckpt 加载边界与 shmap 边界之间的过渡处理。XLA 编译器在遇到不一致的 sharding 约束时，会自动在两端之间插入 reshard 通信，把布局对齐。
 
-实际效果：Grok-1 的 KV cache 在加载/存储时按 (B, T) 切到 8 卡，在 attention 计算时 reshape 成 (B, head) 切。每次 step 有一次 reshard 通信。
+最终的实际效果是：Grok-1 的 KV cache 在加载与存储时按 (B, T) 切分到 8 卡；进入 attention 计算之前会被 reshape 并改成沿 (B, head) 维度切分。每一个 decode step 都会触发一次这种 reshard 通信。
 
 ### 6.6.3 KV cache 总显存账
 
@@ -713,11 +713,11 @@ $$
 = 64 \cdot 33554432 \approx 2.15 \text{ GB}
 $$
 
-如果 batch=8（每卡 1 个 batch），KV cache 涨到 17 GB - 仍可接受。
+如果 batch=8（每张卡负责 1 个 batch），KV cache 总量上升到大约 17 GB，对 8 卡 80 GB H100 来说仍然在可接受范围内。
 
-但如果想做高吞吐 serving（batch=64），KV cache 变成 137 GB - 超过单卡，需要切分到多卡。Grok-1 的 KV cache 按 (data, model) sharding，正好能切到 8 卡，每卡 ~17 GB。
+但如果用于高吞吐 serving 场景（例如 batch=64），KV cache 总量会上升到约 137 GB，单张卡已经无法容纳，必须切分到多卡上。Grok-1 的 KV cache 按 (data, model) 进行 sharding，正好能切到 8 张卡，每张卡承担约 17 GB。
 
-实际生产 serving 用 paged attention 能节省 KV cache（每个 token 分页，未用页不分配显存），但 Grok-1 默认实现不支持这个。
+工业级 serving 一般会使用 paged attention 来进一步节省 KV cache 显存（按 token 分页存储，未使用的页不分配显存），但 Grok-1 默认的开源实现并未支持这种机制。
 
 ## 6.7 `LanguageModelConfig.partition_rules`
 
@@ -728,9 +728,9 @@ def partition_rules(self):
     return LM_PARTITION_RULES + self.model.partition_rules()
 ```
 
-合并语言模型层和 Transformer 层的 rule。`LM_PARTITION_RULES`（`model.py:162-174`）只有 3 条 - embedding、positional_embeddings（实际不用，因为 RoPE 不需要 positional embedding 参数）、和最终 rms_norm。
+这一行将语言模型层与 Transformer 主干层的 partition rule 合并到一起。`LM_PARTITION_RULES`（位于 `model.py:162-174`）只包含 3 条规则：分别对应 embedding、positional_embeddings（实际不会被命中，因为 Grok-1 使用 RoPE，没有显式 positional embedding 参数）、以及最终输出前的 rms_norm。
 
-完整 rule 列表会在 `runners.py:202-209` 被用：
+完整的 partition rule 列表最终会在 `runners.py:202-209` 处被消费使用：
 
 ```python
 # runners.py:202-209
@@ -740,7 +740,7 @@ sharding = jax.tree_util.tree_map_with_path(
 )
 ```
 
-`apply_rules` 函数（`model.py:92-109`）对每个参数路径尝试匹配 rule，匹配上就返回对应 PartitionSpec。
+`apply_rules` 函数（位于 `model.py:92-109`）会针对每一个参数路径依次尝试匹配规则列表，匹配成功时返回对应的 PartitionSpec。
 
 ## 6.8 整张表：所有 module 与参数名
 
@@ -761,19 +761,19 @@ sharding = jax.tree_util.tree_map_with_path(
 | `decoder_layer_i/moe/linear/w` | (8, 6144, 32768) | (None, data, model) |
 | `decoder_layer_i/moe/linear_1/w` | (8, 32768, 6144) | (None, model, data) |
 
-总共约 770 个参数 tensor（64 层 × 12 + 头尾若干）。
+合计大约 770 个参数 tensor（其中 64 层 × 12 个主干参数，再加上头尾若干个额外参数）。
 
 ## 6.9 总结：model.py 的设计风格
 
-1. **Haiku module 树扁平**：很多 `@hk.transparent` 让参数名缩短
-2. **for-loop 展开 64 层**：编译大、但灵活
-3. **sandwich norm**：每层 4 个 RMSNorm
-4. **GeGLU MoE**：8 专家 × top-2
+1. **Haiku module 树整体扁平**：大量使用 `@hk.transparent` 让参数名缩短
+2. **for-loop 显式展开 64 层**：编译产物大但灵活，便于逐层加约束与调试
+3. **sandwich norm**：每一层包含 4 个独立的 RMSNorm
+4. **GeGLU MoE**：8 个专家 + top-2 路由
 5. **GQA 48:8**：6 倍 KV 压缩
-6. **8-bit 量化是一等公民**：Linear 内置反量化路径
-7. **tied embedding**：节省 0.8B
+6. **8-bit 量化作为一等公民**：Linear 内部内置了反量化路径
+7. **tied embedding**：节省约 0.8B 参数
 
-下一章看 checkpoint.py，把这 770 个 tensor 怎么从磁盘 load 到 GPU 讲清楚。
+下一章看 checkpoint.py，把这 770 个 tensor 是如何从磁盘加载到 GPU 显存的过程讲清楚。
 
 ## 延伸阅读
 

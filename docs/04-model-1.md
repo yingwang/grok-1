@@ -214,16 +214,16 @@ $$
 \text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \epsilon}} \cdot \gamma
 $$
 
-理论分析（[RMSNorm paper](https://arxiv.org/abs/1910.07467)）发现：**LayerNorm 的"均值减"步骤对模型质量贡献很小**，删掉后只有微小回退（小于 0.1 PPL）但能省 ~15% 计算。在大模型时代这是免费午餐，所以 LLaMA 起所有主流 base 模型都用 RMSNorm。
+理论分析（[RMSNorm paper](https://arxiv.org/abs/1910.07467)）发现：**LayerNorm 的"均值减"步骤对模型质量的贡献很小**，把它从 norm 操作中删除之后，在多个语言建模任务上 perplexity 的回退都不到 0.1 PPL，但同时可以节省约 15% 的 norm 计算量。在大模型时代这种"质量几乎不变、计算明显减少"的改动几乎没有理由不采用，所以从 LLaMA 起，所有主流 base 模型都把 LayerNorm 换成了 RMSNorm。
 
-bias 项 $\beta$ 同理 - 删掉对质量影响极小，但每个 norm 少 6144 个参数（× 64 层 × 4 个 norm = 1.5M 参数）。在 314B 里数字小，但是一个"减重"哲学的体现。
+bias 项 $\beta$ 同理 - 把它从 norm 中删除对质量影响极小，但每个 norm 因此少 6144 个可学参数（在 Grok-1 中 64 层 × 每层 4 个 norm，总计可省 1.5M 参数）。这个数字在 314B 总参里几乎可以忽略，但它体现的是一种"凡是能省的参数都尽量省"的设计倾向。
 
 ### 4.2.1 与 LLaMA-2 / Mistral 的对比
 
-- **LLaMA-2** 用同样的 RMSNorm，scale 初始化为 1，eps = 1e-6
-- **Mistral / Mixtral** 同 LLaMA-2
-- **Grok-1** eps = 1e-5（默认），略大；scale 在 ckpt 里加载，init 仅占位
-- **Grok-1 用了 4 个 RMSNorm 每层**（pre/post-attention + pre/post-FFN）- 比 LLaMA-2 多一倍
+- **LLaMA-2** 同样使用 RMSNorm，其中 scale 参数在训练开始时初始化为 1，eps 设为 1e-6 防止除以 0
+- **Mistral / Mixtral** 在 RMSNorm 配置上完全沿用了 LLaMA-2 的两项选择，scale 初值与 eps 都不变
+- **Grok-1** 把 eps 默认值放大到 1e-5，比 LLaMA-2 大一个量级；推理代码里 scale 的初始化只用 `Constant(0)` 占位，实际数值从 ckpt 加载，所以"训练时是不是从 1 开始"无从直接判断
+- **Grok-1 每层 RMSNorm 数量是 LLaMA-2 的两倍**：LLaMA-2 一层只有 attention 前和 FFN 前共 2 个 norm，Grok-1 在两个子层的前后各放一个 RMSNorm，每层 4 个 RMSNorm，对应 sandwich norm 布局
 
 第 6 章会展开这个 sandwich norm。
 
@@ -373,7 +373,7 @@ $$
 - 最高频维度：周期约 $2\pi$ token
 - 最低频维度（i = d_h/2 - 1）：周期约 $2\pi \cdot 10000^{(d_h - 2)/d_h} \approx 2\pi \cdot 8500$ token
 
-在 `sequence_len = 8192` 的范围内，最低频维度只完成不到一个周期 - 远没到 RoPE 外推的混叠点。所以 Grok-1 用标准 base 10000 是合理的，没必要像 Llama-3.1 那样升到 500000。
+在 `sequence_len = 8192` 的范围内，最低频维度甚至没有完成一个完整周期 - 距离 RoPE 频率发生混叠的临界点还有相当大的余量。所以 Grok-1 沿用标准 base 10000 是合理的，没有必要像 LLaMA-3.1 那样将 base 提升到 500000 来支持更长的上下文外推。
 
 ### 4.3.3 与 Llama / Mistral 的对比
 
@@ -384,7 +384,7 @@ $$
 | 应用位置 | 在 KV cache update **之前** | 一致 | 一致 | 一致 |
 | 应用对象 | Q + K（不对 V） | 一致 | 一致 | 一致 |
 
-注意 Mixtral 8x7B 把 base 升到了 1000000，是为了支持 32k 上下文外推。Grok-1 只支持 8k，所以 10000 足够。
+注意 Mixtral 8x7B 把 RoPE base 提升到了 1000000，目的是支持 32k 上下文的外推 - base 越大、低频维度的周期越长，能覆盖的位置范围也越大。Grok-1 的上下文上限只有 8k，标准 base 10000 已经足够覆盖。
 
 ## 4.4 注意 RoPE 在 KV cache 更新前后的位置
 
@@ -473,9 +473,9 @@ if kv_memory:
 
 GQA（Grouped Query Attention）是 MHA（Multi-Head Attention）和 MQA（Multi-Query Attention）的折中。
 
-- **MHA**：每个 head 都有独立 Q/K/V，质量最好，但 KV cache 最大
-- **MQA**：所有 head 共享同一组 K/V（即 num_kv_heads = 1），KV cache 最小，但质量下降明显
-- **GQA**：把 Q head 分组，组内共享 K/V
+- **MHA**：标准多头注意力，每个 head 都拥有独立的 Q、K、V 投影矩阵，attention 质量在三种方案中最高，但 KV cache 的体积与 head 数成正比，在长上下文场景下显存压力最大
+- **MQA**：所有 head 共享同一组 K/V（即 `num_kv_heads = 1`），只有 Q 仍按 head 拆分。KV cache 体积是 MHA 的 $1/H$，在三种方案中最小，但因为所有 head 看到的是同一份 K/V，表达能力明显下降，在大模型上往往伴随可观的质量回退
+- **GQA**：把 Q 头分成若干组，组内共享同一份 K/V。组数介于 MHA（组数 = 头数）和 MQA（组数 = 1）之间，KV cache 体积和模型质量也都落在两者之间
 
 对于 Grok-1，64 层 × 8192 token × KV cache：
 
@@ -483,9 +483,9 @@ GQA（Grouped Query Attention）是 MHA（Multi-Head Attention）和 MQA（Multi
 - GQA 48:8：64 × 8192 × 8 × 128 × 2 × 2 = **2 GB / batch**
 - MQA：64 × 8192 × 1 × 128 × 2 × 2 = 256 MB / batch
 
-Grok-1 选 8:1 GQA（48 Q : 8 KV），KV cache 比 MHA 节省 6 倍，比 MQA 大 8 倍。质量 - 内存的中间点。
+Grok-1 选用 6:1 比例的 GQA（48 Q 头对 8 KV 头），KV cache 相对完全 MHA 节省约 6 倍存储，相对 MQA 则大 8 倍。这是在 attention 质量和 cache 体积之间取的一个中间平衡点。
 
-LLaMA-2 70B 选 8:1 GQA（64 Q : 8 KV），Mixtral 8x7B 选 4:1（32 : 8）。Grok-1 介于二者之间。
+LLaMA-2 70B 采用的是 8:1 GQA（64 Q : 8 KV），Mixtral 8x7B 采用的是 4:1 GQA（32 Q : 8 KV）。Grok-1 的 6:1 介于这两者之间，KV 头数同为 8，但 Q 头数比 LLaMA-2 少、比 Mixtral 多。
 
 !!! note "MQA（Multi-Query Attention）"
     标准 MHA 给每个 attention head 都配独立的 K、V 投影，head 数等于 query 头数。Noam Shazeer 在 2019 发现一个简化方案：让所有 head 共用同一组 K、V（`num_kv_heads = 1`），只有 Q 还按 head 分。这样 KV cache 缩小到原来的 1/num_heads，长序列推理时显存压力骤减，但因为所有 head 看的是同一份 K/V，表达能力明显下降。
@@ -650,9 +650,9 @@ reshape 把 `[B, T, kv_h, q_per_kv, V]` 压成 `[B, T, kv_h * q_per_kv * V] = [B
 
 Grok-1 的差异点：
 
-1. **GQA 比例 6:1** - 比 LLaMA-2 70B 的 8:1 更"密"。代价是 KV cache 更大一点（少 6 倍 vs 少 8 倍），收益是表达能力更强
-2. **30·tanh 软裁剪** - 全本书唯一一处显式 logit 裁剪
-3. **sandwich norm** - 见第 6 章
+1. **GQA 比例 6:1**：Grok-1 把 48 Q 头映射到 8 KV 头，每组 6 个 Q 共享一组 K/V，比 LLaMA-2 70B 的 8:1 略密集一些。代价是 KV cache 相对 MHA 节省 6 倍而不是 8 倍，体积稍大；收益是每组共享的 Q 数少了一点，attention 的表达能力相对更接近 MHA
+2. **30·tanh 软裁剪**：Q·K 内积除以 $\sqrt{d_h}$ 后再经过 `30 * tanh(x/30)`，把 attention logit 平滑约束在 $\pm 30$ 区间内。这是本书覆盖的所有模型中唯一一处显式的 logit 裁剪，Gemma 2 后来用了同款 soft-cap，但 LLaMA-2、Mistral、Mixtral 都没有
+3. **sandwich norm**：每个 sub-layer 前后各做一次 RMSNorm，每层共 4 个 RMSNorm。这一布局只见于 Grok-1 与 Cohere Command R 系列，LLaMA-2、Mistral、Mixtral 都是标准 pre-norm，每层只有 2 个。详细对比留到第 6 章 DecoderLayer 精读时再展开
 
 下一章进入本仓库最难的部分：MoE 路由的 shard_map 实现。
 

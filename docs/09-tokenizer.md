@@ -1,6 +1,6 @@
 # 第 9 章 Tokenizer
 
-`tokenizer.model` 是仓库里唯一的二进制文件，2.2 MB（2229219 bytes）。本章把它拆开看清楚。
+`tokenizer.model` 是仓库里唯一的二进制文件，2.2 MB（2229219 bytes）。本章把这个文件拆开逐项核对：算法、特殊 token、词表分布、对各语种的编码效率，以及它与 LLaMA-2 / LLaMA-3 等同代模型 tokenizer 的差异。
 
 ## 9.1 基本信息
 
@@ -45,7 +45,7 @@ pad_token=0,
 eos_token=2,
 ```
 
-**没有显式 BOS 处理** - run.py 里的示例 prompt 直接传给 tokenizer.encode，没有手动加 BOS。这是研究示例的简化做法。
+**没有显式 BOS 处理** - run.py 里的示例 prompt 直接传给 tokenizer.encode，没有手动在序列前补 BOS token。这是研究示例代码的简化做法，正式 inference / fine-tune 时需要按训练时的约定显式补 BOS，否则模型看到的位置 0 token 与训练分布不一致，会影响前几步输出质量。
 
 ## 9.2 BPE vs Unigram
 
@@ -61,7 +61,7 @@ SentencePiece 支持两种主要算法：
 - **BPE**（Byte-Pair Encoding）：从字符开始，反复合并最高频对
 - **Unigram**：基于 EM 训练 unigram language model，选 piece 最大化语料 likelihood
 
-哪种？看前 30 个 piece 的分布：
+要判断 Grok-1 的 tokenizer 用的是哪一种，可以查看词表头部前 30 个 piece 的分布：
 
 | id | piece |
 | --- | --- |
@@ -80,7 +80,7 @@ SentencePiece 支持两种主要算法：
 
 但严格来说没看到 byte fallback piece（id 4-255 应该是 byte 0x00 ~ 0xFF 才对，这里却是其他东西）。实际可能是不带 byte fallback 的 Unigram。
 
-LLaMA 用的是 BPE。Mistral / Mixtral 用 BPE。Grok-1 的 tokenizer 看起来更像 Unigram - 这是个区别。
+LLaMA 系列使用 BPE，Mistral / Mixtral 同样使用 BPE。Grok-1 的 tokenizer 从词表头部排列规律推断更接近 Unigram 算法 - 这是 Grok-1 与同代主流 LLM 在分词侧的一个明确差异，意味着即使 vocab 大小相同，它与 BPE 模型也无法直接共用 ckpt 的 embedding 矩阵。
 
 ## 9.3 词表内容分布
 
@@ -139,12 +139,12 @@ LLaMA 用的是 BPE。Mistral / Mixtral 用 BPE。Grok-1 的 tokenizer 看起来
 
 观察：
 
-1. **英文很高效**：5.36 字/token，与 LLaMA-2 相当
-2. **简体中文中等**：1.00 字/token 在常用字时，复杂语句降到 0.7
-3. **日文较好**：1.33 字/token
-4. **韩文最低**：0.59 字/token，因为韩字组合多
+1. **英文编码效率较高**：实测达到 5.36 字符/token，处于与 LLaMA-2 相当的水平，单 token 平均覆盖一个完整英文单词或常见词的主干部分
+2. **简体中文居中**：在常用字组成的短句上能做到 1.00 字符/token 左右，但句法稍复杂、生僻词稍多的语句会下降到 0.70 字符/token 附近，原因是部分汉字会被回退到更细的 piece
+3. **日文表现较好**：实测 1.33 字符/token，得益于日文的常用汉字与片假名词在词表里有专门 piece，假名连接较短的句子能合并成单个 token
+4. **韩文最低**：仅 0.59 字符/token，原因是韩文的谚文音节由初声、中声、终声组合而成，词表很难覆盖所有组合，多数音节只能逐字符回退编码
 
-中文表现比 LLaMA-2 好（LLaMA-2 中文约 0.5-0.7 字/token，因为 LLaMA-2 词表里中文 piece 较少）。Grok-1 的 131072 词表大概有 1.5 万-2 万中文 piece，对中文用户友好。
+中文表现优于 LLaMA-2（后者中文约 0.4-0.7 字符/token，因为 LLaMA-2 的 32k 词表里专门留给中文的 piece 数量很少）。Grok-1 的 131072 词表中估计有约 1.5 万到 2 万个中文相关的 piece，对中文用户的实际推理成本与上下文利用都更友好。
 
 ## 9.5 与 LLaMA-2 32k 词表的对比
 
@@ -159,15 +159,15 @@ LLaMA 用的是 BPE。Mistral / Mixtral 用 BPE。Grok-1 的 tokenizer 看起来
 
 **131k 词表的好处：**
 
-1. 中文、日文、韩文、阿拉伯文、印地文等语言 token 效率显著提升
-2. 长 prompt 占用更少 token，加快推理
-3. 代码、数学符号有更多专门 piece
+1. 中文、日文、韩文、阿拉伯文、印地文等非拉丁文字语言的 token 效率显著提升，从而在相同上下文窗口内能装下更多有效内容
+2. 同等输入下长 prompt 切出更少的 token，attention 二次开销随 token 数下降，推理速度直接受益
+3. 代码符号、常见数学记号都有专门预留的 piece，使得代码语料的 token 数量更接近字符数
 
 **131k 词表的代价：**
 
-1. **embedding 参数膨胀**：131072 × 6144 = 0.81 B 参数，是 32k 词表（0.20 B）的 4 倍
-2. **输出 logit 矩阵更大**：每 forward step 多 80% 计算（与 hidden dim 比）
-3. **rare token 训练不充分**：低频 piece 看到样本少，质量不稳
+1. **embedding 参数膨胀**：embedding 矩阵规模为 131072 × 6144 = 0.81 B 参数，是 32k 词表（约 0.20 B）的 4 倍，单是 embedding 这一项就给 ckpt 大小带来 ~1.6 GB 增量（bf16）
+2. **输出 logit 矩阵更大**：每个 forward step 的最后一步需要做 hidden×vocab 矩阵乘，词表扩到 4 倍意味着这一步显存与计算量也相应放大，整体相对 hidden 维投影增加约 80% 的 FLOPs
+3. **rare token 训练不充分**：低频 piece 在训练语料里出现样本较少，对应的 embedding 行更新次数有限，导致这些 token 的表示质量不如高频 token 稳定
 
 LLaMA-3 后来也升到 128k 词表（用 tiktoken 而非 sentencepiece），可以说**Grok-1 提早走到了"大词表"路线**。但 Grok-1 用 Unigram 而 LLaMA-3 用 BPE，两者编码结果不兼容 - 不能跨模型迁移 ckpt 的 embedding 矩阵。
 
@@ -227,13 +227,13 @@ tokens = self.tokenizer.encode(request.prompt)
 
 ## 9.8 词表大小的"2 次幂"取整
 
-`vocab_size = 131072 = 2^17`。这是有意取的 2 次幂 - 因为：
+`vocab_size = 131072 = 2^17`。这是一个有意选择的 2 次幂取值，原因包括：
 
-1. **GPU kernel 友好**：很多 GEMM 内核对 2 次幂尺寸有优化
-2. **embedding sharding 方便**：131072 / 8 = 16384，正好 8 个 shard 各分 16384 个 piece，每 shard 整数行
-3. **避免 ragged 长度**
+1. **GPU kernel 友好**：大量 GEMM 与 softmax / log-softmax 内核针对 2 次幂尺寸做过对齐优化，矩阵维度落在 2 次幂上时往往能直接命中最优 tile 大小，避免最后一列的特殊处理
+2. **embedding sharding 方便**：131072 / 8 = 16384，恰好可以让 8 路 tensor-parallel 各承担 16384 行 embedding，每 shard 都是整数行而无 ragged 边界，反向梯度的 all-reduce 通信也更整齐
+3. **避免 ragged 长度**：在做 padding、attention mask 计算、kv-cache 申请时，词表尺寸为 2 次幂可以让相关的内存布局自然对齐，减少为非整长度准备的填充逻辑
 
-LLaMA-2 的 32000 不是 2 次幂（最近的是 32768）- LLaMA 团队为什么选 32000 是个谜。Grok-1 选 131072 显然更工整。
+LLaMA-2 的 32000 并不是 2 次幂（与之最接近的是 32768）- LLaMA 团队选 32000 这个偏数的内部理由从未公开。相比之下 Grok-1 直接选 131072 在工程对齐上更整齐。
 
 ## 9.9 代码与数学符号 token efficiency
 
@@ -244,7 +244,7 @@ LLaMA-2 的 32000 不是 2 次幂（最近的是 32768）- LLaMA 团队为什么
 
 代码效率比中文好，但比 GPT-4 / LLaMA-3 差。LLaMA-3 在代码上能到 3.5-4 字/token，因为它的 BPE 训练时显式加了大量代码语料。
 
-数学符号（LaTeX）特别差 - 1.46 字/token。`\sum`、`\frac` 这种命令各占多个 token。这暗示 Grok-1 训练语料里代码和数学的比例不算特别高。
+数学符号（LaTeX）的编码效率明显偏低 - 仅 1.46 字符/token。`\sum`、`\frac` 这类反斜杠命令在词表里没有专门收录，往往会被拆成反斜杠 + 字母段共 2-3 个 token。这从侧面反映出 Grok-1 在训练 tokenizer 阶段，代码与数学语料所占比重不算特别高，至少没有像 LLaMA-3 那样为代码语料专门扩充词表。
 
 ## 9.10 tokenizer 训练规模未公开
 
