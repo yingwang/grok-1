@@ -5,6 +5,9 @@
 回看 2024 年第一季度，开源大模型的格局正好处于一个转折点。
 
 - **稠密派**：Meta 的 LLaMA-2 在 2023 年 7 月发布，最大 70B，是工业界用得最多的开源 dense 模型；2 月 21 日，Google 又开源了 Gemma 7B / 2B，依然走稠密路线
+
+!!! note "稠密模型（dense model）"
+    "稠密"是相对 MoE 的另一极：每一层的 FFN 只有一份，所有 token 都走同一组参数，没有路由也没有专家。激活参数等于总参数，每个 token 都把整张网络跑一遍。LLaMA、Gemma、Mistral 7B 这些都是稠密模型；同等总参规模下稠密模型推理时算力消耗远比 MoE 大，但工程上更简单 - 不用考虑专家负载均衡、不用专门切 expert 维度的并行，社区生态也更成熟。Grok-1 314B 如果做成稠密就是 314B 全激活，推理算力会涨到 3.6 倍。
 - **MoE 派的开端**：2023 年 12 月 8 日，Mistral AI 通过一条没有任何说明文字的磁力链放出 Mixtral 8x7B（47B 总参，13B 激活），用 MoE 把 Llama-2 70B 在多项基准上拉下马
 - **闭源的怪兽**：GPT-4、Claude 3、Gemini 1.5 都已经被广泛猜测是 MoE，但只是猜测
 
@@ -71,6 +74,11 @@ grok_1_model = LanguageModelConfig(
 - FFN widening factor $w = 8$，对 SwiGLU 实际中间维度由 `ffn_size(d, w)` 计算（见第 3 章）
 - $H_q = 48$ Q 头、$H_{kv} = 8$ KV 头、$d_h = 128$
 
+!!! note "SwiGLU（FFN 的激活函数变体）"
+    标准 FFN 是 `down(activation(up(x)))`，激活函数早期是 ReLU、后来是 GELU，都是单分支的。GLU 系列把 FFN 改成两分支结构：`down((up_gate(x) * activation(up_value(x))))` - 一个分支算 value、另一个分支算 gate（值在 0-1 附近），两路相乘再 down-project。SwiGLU 就是激活函数选 SiLU（也叫 Swish）的 GLU 变体。
+
+    代价是 FFN 多了一组 up 矩阵，参数从 2 块变 3 块，所以业内的惯例是把中间维度 `d_ffn` 乘 2/3 来对齐总参数量。Grok-1 的 widening_factor=8，经过 `ffn_size` 里的 `* 2 // 3` 就得到 d_ffn = 32768。每个专家三个矩阵（linear、linear_v、linear_1）都是 `with_bias=False`。
+
 每层参数主要分两块：
 
 **Attention（GQA）：**
@@ -105,6 +113,11 @@ $$
 这两个量是**完全独立的**。如果你的目标是"低成本部署"，你关心激活参；如果你的目标是"硬件门槛"，你关心总参。MoE 的精髓就是把这两件事解耦 - 用同样的算力可以装更大的模型。
 
 但 Grok-1 把"显存"这一面榨到了极限：314B 即便 8-bit 量化也要 314GB 显存，单机 8 卡 H100 80GB 总共 640GB，留给 KV cache 和激活的余地只有 100GB 左右。这是 Grok-1 推理硬件门槛 8 卡起跳的根本原因 - 与激活参的大小关系不大，与总参直接相关。
+
+!!! note "8-bit 量化"
+    训练时参数通常是 fp32 或 bf16，每个权重占 4 字节或 2 字节。推理阶段精度其实用不到那么高 - 把每个权重压到 int8（1 字节）甚至 int4，模型质量损失很小但显存占用直接减半甚至减到四分之一。常见做法是把一组 weight（比如一整行）记录一个 fp16 的 scale + 一组 int8 数值，算的时候动态 dequantize 回浮点。
+
+    Grok-1 的开源 ckpt 已经是 int8 量化的（见第 7 章），单个 shard 文件就标了 `WEIGHT_FP8` 之类的 dtype，所以"314B 参数"实际硬盘占用约 314GB。即便如此 8 卡 H100 也只剩 100GB 左右给 KV cache 和激活，推理时硬件压得很紧。
 
 第 7 章会算清楚显存账。
 

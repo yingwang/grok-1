@@ -1,8 +1,21 @@
 # Grok-1 中文精读
 
+!!! note "MoE（Mixture of Experts）"
+    标准 transformer 里，每个 token 在 attention 之后会进入 FFN（前馈网络），同一层所有 token 共用同一个 FFN。MoE 把这一层换成一组 FFN，每个叫一个"专家"。token 进来时，一个小网络（路由器）给所有专家打分，挑分数最高的几个，token 只在这几个里完成 FFN 计算，剩下的不参与。
+
+    好处很明显：模型总量可以做得很大，算力却不用跟着同比膨胀。Grok-1 一共 8 个专家，每个 token 只激活其中 2 个，所以参数虽然有 314B，单个 token 实际用上的只有 86B 左右。
+
+!!! note "JAX / Haiku"
+    JAX 是 Google 出的数值计算库，可以理解成"带自动微分和 XLA 编译的 numpy"。和 PyTorch 最大的差别是它走纯函数式那一套：tensor 不可变、模型不持有参数、随机数要显式传 key、控制流要用 `jnp.where` 不能用 Python 的 `if`。好处是 jit + 多卡并行（pjit / shard_map）写起来很自然，代价是心智模型和 PyTorch 几乎不通用。
+
+    Haiku 是 DeepMind 在 JAX 上做的薄薄一层神经网络框架，作用是把"带 `hk.Module` 的函数"转成 `(init_fn, apply_fn)` 两件套，让你用近似 PyTorch 的写法描述模型，但参数仍然是外部传入的 pytree。Grok-1 就是纯 JAX + Haiku 0.0.12 写的，没有任何 PyTorch 代码 - 这也是它至今没有像 LLaMA 那样长出生态的原因之一。
+
 ## 这本书是什么
 
 2024 年 3 月 17 日，xAI 用一条磁力链放出了 Grok-1 的全部权重和推理代码：314B 参数、8 选 2 的 MoE、Apache 2.0 协议。这是当时已开源的最大模型，也是 xAI 至今唯一一次开源核心 base model。一年多之后，Grok-1.5、Grok-2、Grok-3 都没有再走开源路线。也就是说，这 9GB 的代码和约 300GB 的权重，是公众能合法、完整地拆解 xAI 训练栈的唯一窗口。
+
+!!! note "magnet link（磁力链）"
+    BitTorrent 协议里的一种"去中心化的下载入口"，本质是一串包含文件哈希的 URI，丢给 BT 客户端后，客户端会去 DHT 网络里找到正在做种的 peer，然后从这些 peer 那里把文件拉下来。优点是发布方不用挂 HTTP 服务器、不会被单点限流。xAI 当时给的就是一条 magnet 链接，约 300GB 权重，社区在第一天用 BT 协同分发完。
 
 本书逐行精读这 9GB 代码。重点是：把 `run.py`、`checkpoint.py`、`runners.py`、`model.py` 四个文件里每一处不寻常的设计选择讲清楚 - RoPE 用哪种归一化、attention logit 为什么要过 `tanh` 软裁剪、MoE 为什么用最朴素的 `einsum` 而不是写 kernel、KV cache 怎么和 JAX 的 `shard_map` 协作、`hk.transparent_lift` 怎么在 Haiku 里偷偷复制 8 份 expert 参数。
 

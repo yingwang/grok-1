@@ -10,6 +10,11 @@
 
 读完本章你应该能在脑子里把"一次 attention 调用"全程跑一遍：输入是 `[B, T, d]`，输出是 `[B, T, d]` + 更新后的 KV cache，中间经过哪些 reshape、哪些 RoPE 角度、哪些 partition 约束。
 
+!!! note "KV cache（Key/Value Cache）"
+    自回归生成时每生成一个新 token，都要让它的 query 与前面所有 token 的 key/value 做 attention。如果每步都重算所有历史 token 的 K、V，复杂度是 O(T²)，T 一长就吃不消。KV cache 的做法是把每层 attention 算过的 K、V 存下来，下一步只算新 token 的 K、V 然后追加到 cache 末尾，attention 就退化成一次 [1, T] × [T, d] 的乘法。
+
+    Grok-1 的 KV cache 形状是 `[B, T=8192, num_kv_heads=8, key_size=128]`，每层一份，64 层加起来 batch=1 时约 2 GB；GQA 把 KV 头数从 48 砍到 8 直接给 cache 减重 6 倍。
+
 ## 4.1 `Linear`：内置 8-bit 反量化
 
 `model.py:525-584`。Grok-1 自己写了一个 `Linear`，继承 `hk.Linear`，主要为了：
@@ -110,6 +115,11 @@ tree_util.register_pytree_node(
 
 `run.py:17` 重导出为 `QW8Bit`，但 `run.py` 没真的用到 8-bit - 默认是全精度 bf16 加载。
 
+!!! note "bf16 / fp32 混合精度"
+    bf16 是 16 位浮点，1 位符号 + 8 位指数 + 7 位尾数，动态范围和 fp32 一致但精度低。大模型推理用 bf16 做矩阵乘是因为它能让 H100/A100 的 tensor core 跑满，吞吐是 fp32 的 8 倍多，显存也减半。但 bf16 的尾数只有 7 位，在 softmax、norm、累加这种"小数差异要保留"的地方会丢精度。
+
+    工程做法是"大头 bf16，敏感点 fp32"：参数和 activation 在 bf16 下流动，遇到 RMSNorm 把输入 cast 到 fp32 算完再 cast 回来，attention logit cast 到 fp32 做 softmax 再 cast 回来，bias 也用 fp32 维护。Grok-1 这一套精度策略贯穿全文 - Linear 的 `fprop_dtype = inputs.dtype` 和 RMSNorm 的 `inputs.astype(jnp.float32)` 都是这个套路的局部体现。
+
 ## 4.2 `RMSNorm`：fp32 中间计算
 
 `model.py:587-624`：
@@ -157,6 +167,11 @@ class RMSNorm(hk.RMSNorm):
 ```
 
 数学上：
+
+!!! note "RMSNorm（Root Mean Square Norm）"
+    LayerNorm 做两件事：先把激活减去均值、除以标准差，再乘一个可学的 scale 加一个 bias。RMSNorm 把减均值和加 bias 都砍掉，只留"除以 RMS 再乘 scale"这一步，RMS 是 `sqrt(mean(x^2))`，比标准差好算一点。
+
+    省掉减均值这一步的依据来自原 paper 的消融：transformer 里"中心化"对最终质量的贡献几乎可以忽略，真正起作用的是"按尺度归一化"。RMSNorm 的训练曲线和 LayerNorm 几乎重合，但参数和 FLOPs 都少一截。在 LLaMA 之后这套基本是新 dense / MoE base 模型的默认 norm 写法，看到 LayerNorm 反而要追究一下是不是有别的考量。
 
 $$
 \text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \epsilon}} \cdot \gamma
@@ -211,6 +226,16 @@ bias 项 $\beta$ 同理 - 删掉对质量影响极小，但每个 norm 少 6144 
 - **Grok-1 用了 4 个 RMSNorm 每层**（pre/post-attention + pre/post-FFN）- 比 LLaMA-2 多一倍
 
 第 6 章会展开这个 sandwich norm。
+
+!!! note "残差流（Residual Stream）"
+    transformer 里每个子层（attention、FFN/MoE）的输出不是替换掉输入，而是和输入相加：`x_new = x + sublayer(x)`。这条"一直被加东西的主线张量"就叫 residual stream。从输入 embedding 一路传到最后一层 norm 前，中间每个子层只是往这条流上贡献自己的"修正量"。
+
+    这个视角对理解 sandwich norm 很关键：sandwich norm 在乎的不是子层内部的数值，而是"加进残差流的那一份量级要可控"。Grok-1 的残差流维度是 6144，要从 64 层、每层 4 个 RMSNorm 的连续累加里保持稳定，所以 xAI 把每个子层输出都先 RMSNorm 一次再加回去，等价于强制每次贡献的量级都在 ~1 附近。
+
+!!! note "RoPE（Rotary Position Embedding）"
+    早期 Transformer 用 sinusoidal 或学得的绝对位置 embedding，做法是把一组位置向量直接加在 token embedding 上，让位置信息和内容信息共享同一组维度。RoPE 换了个思路：位置不再加在 embedding 上，而是在 attention 里对 Q、K 做一组按位置变化的旋转。第 m 个 token 的 Q 向量按 m 角度转、第 n 个 token 的 K 按 n 角度转，做内积时旋转量自动相减，最后 attention score 只看 Q 和 K 的相对位置差，绝对位置自然消掉。
+
+    这个改动看起来只是数学技巧，但实践收益很明显：不再有"绝对位置参数"这种东西，外推到训练时没见过的长度上不会立刻失效；旋转是逐 head 内部做的，不挤占模型其他维度。在 LLaMA 之后这套基本是 dense 与 MoE base 模型的默认位置编码方案，差别只剩下 base 取多大、要不要做长度外推插值这些二阶问题。
 
 ## 4.3 RoPE：`rotate_half` 与 `RotaryEmbedding`
 
@@ -423,13 +448,28 @@ if kv_memory:
 
 `update_into` 用 `jax.lax.dynamic_update_slice_in_dim` 把新 K/V 写到 `kv_memory.step` 指定的位置。`jax.vmap` 把它沿 batch 维 vmap，因为不同 batch 元素可能有不同的 step。
 
+!!! note "dynamic_update_slice / dynamic_slice"
+    JAX 在 jit 编译时要求所有 tensor 的形状是静态的，但写 KV cache 这种"把新算好的 [B, 1, H, D] 段塞到 [B, 8192, H, D] 大 cache 的某个动态位置"操作，slice 的 start index 是个运行时变量。普通的 Python 切片 `cache[:, step]` 在 jit 下不允许。
+
+    `jax.lax.dynamic_update_slice_in_dim(mem, update, start, axis=0)` 就是 JAX 提供的"静态形状、动态起点"的 in-place 写入原语，对应的读取是 `dynamic_slice`。底层 XLA 编译时会把它编成一个带 offset 参数的 memcpy。Grok-1 用它沿 axis=1（seq 维）把新 token 的 K/V 写入 `kv_memory.step` 指定的位置，再通过 `jax.vmap` 让 batch 中每个元素的 step 可以不同。
+
 `memory_mask`：构造一个 `[T]` 的 0/1 mask，"位置 < 当前 step" 的为 1。然后 expand 成 `[B, 1, 1, T]`，再和 causal mask 相乘。
+
+!!! note "causal mask（因果遮罩）"
+    自回归语言模型要求位置 i 的 token 只能看到位置 ≤ i 的 token，否则训练时模型会"偷看"未来的答案。实现方式是给 attention 的 [T, T] logit 矩阵叠一个下三角 mask：保留下三角和对角线（i ≥ j 处为 1），上三角（i < j 处）置成 -1e30 或 -inf，softmax 后就变成 0。
+
+    Grok-1 在 `Transformer.__call__` 里用 `jnp.tril(jnp.ones((1, 1, seq_len, seq_len)))` 直接构造一个下三角 mask，再和 padding mask 相乘得到最终 `[B, 1, T, T]` 的 mask。decode 阶段每步只有 1 个新 query，causal mask 退化成 [1, 1]，真正起作用的是 `memory_mask`（只允许 attend 到 cache 里已写入的位置）。
 
 ## 4.5 `MultiHeadAttention.__call__` 全程
 
 `model.py:720-911` 是 attention 主体。我们已经看过 RoPE + cache 部分（4.4），现在看 attention 本身的计算。
 
 ### 4.5.0 GQA 的工程动机
+
+!!! note "GQA（Grouped Query Attention）"
+    标准 multi-head attention 里 Q 头数等于 KV 头数，每个 head 都有自己独立的一组 K、V。一旦头数和层数变多，推理时 KV cache 占的显存会膨胀到很难接受 - 因为 cache 大小正比于 `层数 × 头数 × seq_len × head_dim`，每一项都是几十量级。GQA 的思路是把 Q 头分成若干组，组内共享一组 K、V：比如 48 个 Q 头分 8 组，每组 6 个 Q 共用同一组 K、V，cache 立刻只剩原来的 1/6。
+
+    这背后是一种"不对称的表达力假设" - 模型对"提问的方向"需要保留 multi-head 的多样性，但同一份 K/V 上挂多组 Q 一起去检索，质量损失很小。MQA（所有 head 共享 1 组 K/V）是这个思路的极端版，质量明显下降；GQA 介于 MHA 和 MQA 中间，是 LLaMA-2 70B 起几乎所有大模型 attention 的默认选项，只是各家在分组比例上小有差异。
 
 GQA（Grouped Query Attention）是 MHA（Multi-Head Attention）和 MQA（Multi-Query Attention）的折中。
 
@@ -446,6 +486,11 @@ GQA（Grouped Query Attention）是 MHA（Multi-Head Attention）和 MQA（Multi
 Grok-1 选 8:1 GQA（48 Q : 8 KV），KV cache 比 MHA 节省 6 倍，比 MQA 大 8 倍。质量 - 内存的中间点。
 
 LLaMA-2 70B 选 8:1 GQA（64 Q : 8 KV），Mixtral 8x7B 选 4:1（32 : 8）。Grok-1 介于二者之间。
+
+!!! note "MQA（Multi-Query Attention）"
+    标准 MHA 给每个 attention head 都配独立的 K、V 投影，head 数等于 query 头数。Noam Shazeer 在 2019 发现一个简化方案：让所有 head 共用同一组 K、V（`num_kv_heads = 1`），只有 Q 还按 head 分。这样 KV cache 缩小到原来的 1/num_heads，长序列推理时显存压力骤减，但因为所有 head 看的是同一份 K/V，表达能力明显下降。
+
+    GQA 是 MQA 和 MHA 的折中 - 把 head 分组，组内共享 K/V。Grok-1 选 48 Q : 8 KV 的 6:1 GQA，KV cache 比 MQA 大 8 倍但比 MHA 小 6 倍，质量回到接近 MHA 的水平。
 
 ### 4.5.1 Q/K/V 投影
 
@@ -520,6 +565,11 @@ attn_logits = max_attn_val * jnp.tanh(attn_logits / max_attn_val)
 
 Q 被 reshape 成 `[B, T, 8, 6, 128]` - 8 个 KV group，每 group 6 个 Q 头。
 
+!!! note "einsum（Einstein Summation）"
+    `jnp.einsum` 用一个字符串描述任意阶张量的乘加：箭头左边写输入张量的下标，右边写输出的下标，凡是左边出现但右边没出现的下标都被 sum 掉，相同字母代表 broadcast 或共缩。比如 `"ij,jk->ik"` 就是普通矩阵乘，`"bij,bjk->bik"` 是带 batch 的矩阵乘。
+
+    einsum 在 attention 实现里特别好用，因为 Q/K/V 是 4-5 阶张量、混合了 batch、head、seq、dim 多个维度。Grok-1 GQA 的核心一行 `"...thHd,...Thd->...hHtT"` 里 K 没有 H 维（q_per_kv），einsum 自动让 K 在 H 上 broadcast - 等于免费实现了"每 6 个 Q 头共享 1 组 K/V"的 GQA 语义，不用手动 tile K。
+
 注意 einsum：`"...thHd,...Thd->...hHtT"`
 
 - 输入 Q：`[..., t, h=kv_h, H=q_per_kv, d=128]`
@@ -536,6 +586,11 @@ attn_logits = 30 * tanh(attn_logits / 30)
 ```
 
 这是第 3 章 3.3.2 说过的软裁剪。
+
+!!! note "attention logit 软裁剪（soft-cap）"
+    Attention 里 Q 和 K 算完点积、除以 `sqrt(d_k)` 之后会得到一组 logit，正常分布在 ±十几的量级。但训练时偶尔会出现某个 logit 异常爆掉到几十甚至上百 - 通常是某对 Q/K 的内容恰好在某些维度上严重共线，再叠上 bf16 的低精度，单个值就走偏了。一旦这种 logit 进了 softmax，`exp` 一下立刻顶到 fp16/bf16 的上限，结果出 NaN，反传梯度爆炸，整轮训练报废。
+
+    硬截断（直接 clip 到 ±cap）能挡住 NaN 但不可导，截断点附近梯度为 0。软裁剪改写成 `cap * tanh(x / cap)`：小 logit 几乎不动（tanh 在 0 附近就是恒等映射），大 logit 被慢慢压到 ±cap 这个上界，全程光滑可导。代价是真的需要极大 logit 才能区分某两个 K 时，差别会被 tanh 抹掉一点，但实际训练里这种极端情形相当罕见。Gemma 2 后来同款思路用 cap = 50，做的是同一件事。
 
 ### 4.5.3 mask 与 softmax
 

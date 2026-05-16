@@ -10,6 +10,11 @@ Grok-1 是 **64 层 decoder-only transformer**，每一层把 FFN 子层换成 *
 
 1. **GQA：48 Q 头对 8 KV 头**，比例 6:1（LLaMA-2 70B 是 64 Q 对 8 KV，比例 8:1）
 2. **每个 sub-layer 用了两次 RMSNorm**：pre-norm + post-norm 都做，是 Cohere Command R 同款的"sandwich norm"（`model.py:1056-1060`，下文 2.5 详述）
+
+!!! note "sandwich norm（pre + post 双 norm 布局）"
+    早期 transformer 是 post-norm：`y = LayerNorm(x + SubLayer(x))`，深网络梯度反传时常炸。主流后来切到 pre-norm：`y = x + SubLayer(LayerNorm(x))`，深层稳很多但 residual 流的量级会随层数累积上涨。
+
+    sandwich norm 把两者夹在一起：`y = x + LayerNorm(SubLayer(LayerNorm(x)))` - 进子层前 norm 一次（pre）、出子层加回 residual 前再 norm 一次（post）。两次 norm 把 residual 流和子层输出都钳住，深网络训练更稳。代价是每层多一次 RMSNorm 计算（在 314B 里几乎免费）。Grok-1 64 层 + 4 个 RMSNorm/层（attention pre/post + FFN pre/post），共 256 次 norm，是 Cohere Command R 同款选择。
 3. **embedding 用 sqrt(d) 量级放大**，输出再乘 1/sqrt(3) - 这是 µ-Transfer / DeepNet 风格的 scale 控制
 4. **attention logit 用 `30 * tanh(x/30)` 软裁剪**，防止溢出（`model.py:864-865`）
 5. **MoE 路由没有 auxiliary loss、没有 capacity drop**：纯 softmax + top-2，所有 token 一律走两个专家
@@ -59,6 +64,11 @@ graph TD
 图里的关键步骤：
 
 - **InOutEmbed**：输入 token id 通过查表得到 hidden 向量。输出阶段同样的 embedding 矩阵转置后做 logit 投影。这种"输入输出共享 embedding"叫 tied embedding，节省 0.81B 参数
+
+!!! note "tied embedding（输入输出共享 embedding 矩阵）"
+    Transformer 输入端有个 embedding 矩阵 `(V, d)`，token id 查表拿到 hidden；输出端做 next-token 预测时需要从 hidden 投回 `(V,)` 维 logits，理论上是另一个 `(d, V)` 矩阵。tied embedding 的做法是让这两个矩阵共享同一份参数 - 输出投影直接用输入 embedding 的转置 `hidden @ embed_mat.T`，省掉一整块大参数。
+
+    Grok-1 词表 131072、d=6144，单独一份就是 0.81B 参数 - tying 之后总参省一份。GPT-2、LLaMA 系列都用 tied embedding，Grok-1 在 `InOutEmbed`（`model.py:1110-1143`）里实现的就是这种共享。
 - **\*embedding_multiplier_scale**：embedding 出来后乘以 78.38（≈ $\sqrt{d}$）的放大因子，这是 Vaswani 2017 风格的设计
 - **每层 RMSNorm 共出现 4 次**：pre-attn、post-attn、pre-FFN、post-FFN，这是 Grok-1 的"sandwich norm"
 - **GQA 48Q vs 8KV**：48 个 query head 分 8 组，每组 6 个 Q 共享一组 K/V
@@ -268,6 +278,11 @@ TRANSFORMER_PARTITION_RULES = [
 `run.py:60` 给的 `local_mesh_config=(1, 8)`，即 1 × 8 = 8 个 device，全部都给 model 维。`between_hosts_config=(1, 1)` 表示单机。如果是 16 卡分两机，会变成 `local_mesh_config=(1, 8)` + `between_hosts_config=(1, 2)`。
 
 这种"全 model 不切 data"的策略，意味着 Grok-1 在 8 卡上跑的是**纯 tensor parallel** - 一个 batch 在所有卡上共享同一份计算图，但每张卡只保留一部分参数和激活。和 dense 模型在 8 卡上做 tensor parallel 的拓扑几乎一样。
+
+!!! note "tensor parallel / data parallel / model parallel"
+    单机装不下的模型在多卡上有几种切法。**data parallel** 最简单：每张卡都有完整模型副本，把 batch 切几份让各卡同时算自己那份 micro-batch，最后 all-reduce 梯度 - 显存吃紧时根本用不了。**tensor parallel** 是把单个矩阵沿某一维切到多张卡上，每张卡只持有一部分 weight，forward 时 matmul 拆成多卡协作算，结果 all-gather 拼回来 - 显存压力小但通信频繁，对 NVLink 之类的高带宽互联很依赖。**model parallel** 是更宽的概念，pipeline parallel（按层切，一张卡跑前 16 层、另一张跑后 16 层）也算一种 model parallel。
+
+    Grok-1 默认 mesh = (1, 8) - data 维 1 个 shard、model 维 8 个 shard，相当于纯 tensor parallel 8 卡。MoE 还多一个 expert parallel 维度，但 Grok-1 没单独切 expert，是通过 `shard_map` 在 model 维上把 expert 维度顺手切了。
 
 如果想做 data parallel（batch 在多卡间并行），需要把 mesh 改成 (2, 4) 或 (4, 2) 这种比例。但 314B 的总参根本不允许在 < 8 个 device 上做 model dim 切分 - 4 个 device 一个 model shard 是 78 GB，超过单卡 80 GB 上限。所以 mesh 形状被显存上限锁死了。
 

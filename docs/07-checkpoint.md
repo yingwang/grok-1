@@ -2,6 +2,11 @@
 
 `checkpoint.py` 只有 221 行，但它解决的问题不小：把 300+ GB 的权重在多 host / 多 device 的环境下、从磁盘加载到 JAX 的全局分布式数组里。本章把这个流程拆清楚。
 
+!!! note "multi-host / SPMD（Single Program Multiple Data）"
+    单台机器装不下 314B 权重，所以 Grok-1 假设你有若干台机器（host），每台机器若干张 GPU（device）。每台机器各自跑同一份 Python 程序，但只负责整个模型的一小块，靠 NCCL/通信库交换中间结果。这种"同一份代码 + 各跑各的分片"的模式就叫 SPMD。
+
+    JAX 用 `jax.process_index()` 给每台机器一个编号，加载 ckpt 时各台机器按编号决定自己读哪些文件。Grok-1 的 `run.py` 默认配置是单机 8 卡，所以 `jax.process_count() = 1`、`jax.process_index() = 0`，多 host 路径退化掉；但 7.4、7.5 的代码逻辑是为多机准备的。
+
 ## 7.1 ckpt 的物理布局
 
 Grok-1 的 ckpt 通过 magnet 链接或 HuggingFace 下载，得到一个 `ckpt-0/` 目录，结构是：
@@ -21,6 +26,11 @@ ckpt-0/
 - `shard` 是该 tensor 的分片索引（0~7，对应 8 个 model shard）
 
 每个文件是一个 **pickle**，序列化了一个 numpy/JAX 数组（或 `QuantizedWeight8bit`）。
+
+!!! note "pickle"
+    Python 自带的对象序列化协议。`pickle.dump(obj, f)` 把任意 Python 对象（dict、numpy array、自定义 class 实例）转成字节流写文件，`pickle.load(f)` 反过来还原。它的方便之处是不用自己写 schema，连嵌套结构都能直接存；缺点是反序列化时会执行字节流里描述的"如何还原 class"的指令，所以恶意 pickle 文件能在你的进程里跑任意代码。
+
+    Grok-1 的 ckpt 一共 ~770 个 tensor × N 个分片 ≈ 几千个 pickle 文件，每个文件存一个 numpy 数组或 `QuantizedWeight8bit` 实例。整套 296 GB 都靠 pickle 序列化。
 
 总体大小（HuggingFace 上 xai-org/grok-1）：约 296 GB（8-bit 量化）。如果用原始 bf16，约 600 GB。
 
@@ -93,6 +103,11 @@ def fast_unpickle(path: str) -> Any:
 ```
 
 整套机制是：**先把 ckpt 文件复制到 `/dev/shm`（tmpfs，内存盘），再 pickle.load**。
+
+!!! note "/dev/shm（tmpfs）"
+    Linux 提供的一块"用内存当磁盘"的目录。写到 `/dev/shm/xxx` 的文件不落盘，直接放在 RAM 里，读写速度等同内存。它的容量默认是物理内存的一半，重启即丢失，进程退出不会自动清理（所以代码里用 contextmanager + `os.remove` 显式删）。
+
+    Grok-1 的 `fast_unpickle` 先把 ckpt 文件 `shutil.copyfile` 到 `/dev/shm` 再 `pickle.load`，目的是把后续随机 IO 全部喂给内存而不是 NFS / SSD。32 个 worker 同时跑，并发占用峰值约 32 × 5 GB ≈ 160 GB，所以单机 RAM 至少要预留 32 GB 富余给 shm。
 
 为什么这么做？
 

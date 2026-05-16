@@ -43,6 +43,11 @@ graph TD
 
 ## 5.2 `Router`：路由器
 
+!!! note "top-k routing / Router"
+    MoE 选专家这一步叫 routing，做这件事的小网络叫 router。最常见的写法是：router 就是一个 `(d, E)` 的线性层（`E` 是专家数），对当前 token 的 hidden 算出 `E` 个分数，softmax 一下得到每个专家的"路由概率"，挑分数最高的 k 个专家，token 在这 k 个里完成 FFN 计算，输出再按 routing 概率加权求和。
+
+    这套设计的核心约束有两个。一是 router 必须**便宜** - 因为它在每个 MoE 层、每个 token 上都要跑一遍，太重了会把 MoE 的省算力收益吃光，所以基本固定成"一个线性层"，不再加非线性、不再堆参数。二是 router 输出要能驱动一个**离散选择**（挑 top-k），但梯度只能通过被选中那几个 expert 的 gate 概率回流，没被选中的专家这一步拿不到梯度。这个"硬选择"是 MoE 各种工程麻烦（负载塌缩、训练不稳）的源头，后续的 aux loss、z-loss、capacity factor 都在围着它打补丁。
+
 `model.py:208-269`：
 
 ```python
@@ -134,6 +139,11 @@ $$
 通过加噪让 expert 选择更分散。Grok-1 **不加噪**。
 
 GShard / GLaM 还有 "z-loss" - 惩罚 logit 的范数避免发散。Grok-1 **没有任何辅助损失**（至少推理代码看不到）。
+
+!!! note "z-loss"
+    MoE 训练里 router 的 softmax logit 可以无限增长 - 让 logit 变大能让 routing 决策更"硬"（接近 one-hot），但同时让 softmax 的 `log(sum_i exp(logit_i))` 这一项数值越界，bf16 下 logit 超过 ~88 就 inf。z-loss 是个简单正则项：在主 loss 上加 $\alpha \cdot (\log Z)^2$，其中 $Z = \sum_i \exp(\text{logit}_i)$。它惩罚 partition function 偏离 1，等价于把 logit 整体往 0 拉。
+
+    Switch Transformer / GLaM 论文里 z-loss 系数典型取 1e-4，是防止 MoE 训练后期 logit 爆炸的标准手段。Grok-1 推理代码里没看到 z-loss 痕迹（虽然 8 个 expert 的 314B 训练时几乎肯定用了），训练时具体系数 xAI 没公开。
 
 ### 5.2.2.1 fp32 路由是不是必须
 
@@ -247,6 +257,11 @@ params = lifted_init_fn(
 2. `vmapped_init_fn = jax.vmap(init_fn, in_axes=0, out_axes=0)`：在第 0 维 vmap，意味着如果传入 8 份随机种子和 8 份 dummy 输入，输出是 8 份参数（每份 shape 多一个 leading "8" 维）
 3. `lifted_init_fn = hk.experimental.transparent_lift(vmapped_init_fn)`：把 vmapped init 函数"提升"到当前 hk transform 上下文 - 让它产生的参数名注册到当前 module 的 scope（"moe"）下，所以参数名变成 `moe/linear_v/w`，shape 是 `[8, 6144, 32768]`
 4. `lifted_init_fn(...)`：实际调用，返回 params。这些 params 的 shape 多了一个 leading expert 维度
+
+!!! note "`hk.experimental.transparent_lift`"
+    Haiku 的参数命名靠 `hk.transform` 的上下文：在 transform 内部调 `hk.get_parameter` 会按当前 module 的 name 自动注册参数。但 `MoELayer._inference_call` 里要做一件特殊事 - 先用 `hk.transform(layer_fn)` 把 DenseBlock 的 init 函数提取出来，再用 `jax.vmap` 把它复制成 8 份得到 8 个 expert 的参数。如果直接调用 vmapped 后的 init，新参数会注册到一个新的、独立的 transform 上下文里，和外层 MoELayer 的参数树脱节。
+
+    `hk.experimental.transparent_lift` 就是用来"把内层 transform 的参数提升回外层 transform 上下文"的 API：它让 vmapped init 产生的参数名直接挂到当前 MoELayer 的 scope（`moe/...`）下，于是 8 个 expert 的权重以 `moe/linear_v/w`、shape `[8, 6144, 32768]` 的形式出现 - 这正好是 Grok-1 ckpt 里 expert 参数的存储格式。
 
 得到的 `params` 结构大致：
 
@@ -495,9 +510,19 @@ Grok-1 推理代码里：
 
 这意味着推理时如果某个 expert 被严重过拟合（所有 token 都选它），不会有任何均衡机制。但实际中训练好的 ckpt 已经隐含负载均衡（训练时应该是有 aux loss 的，只是没在推理代码暴露）。
 
+!!! note "auxiliary loss / 负载均衡损失"
+    Router 训练里有个老问题：模型很容易学到"把所有 token 都送到同一个专家"这种退化解。反正只要这个专家学得好，主 loss 就能降，其他 7 个专家可以摆烂；而它们一旦摆烂就拿不到梯度，永远学不出来，模型实际只用 1/E 的容量。
+
+    辅助 loss 的标准做法是显式惩罚不均衡：算一遍每个专家拿到的 token 比例 `f_i`、每个专家收到的平均 routing 概率 `p_i`，把这两个量的点积乘以专家数 `E · sum(f_i · p_i)` 加进总 loss。直觉是 - 一旦某个专家既"被分得多"又"被打得高"，这个乘积就大，loss 推着 router 把负载摊平。Switch Transformer 用系数 0.01，是 MoE 训练几乎绕不开的一项。Mixtral 在论文里选择不显式加 aux loss、靠数据本身的多样性让 router 自己分化，这条路能不能走通和训练数据的结构强相关。
+
 ### 5.5.1 推理时 token drop 的实际影响
 
 假设训练时用了 aux loss + capacity factor = 1.0，drop 了 5% 的 token。这些 token 在 drop 后直接走 residual（FFN 输出为 0）。模型适应了这种"5% drop"状态。
+
+!!! note "capacity factor / capacity drop"
+    aux loss 是个"软"约束 - 它把不均衡推回均衡，但不保证某一 batch 里所有专家都能恰好处理同样多 token。工程上还有个独立问题：如果某一 batch 里恰好很多 token 都想去同一个专家，那个专家算不过来怎么办？训练时所有 expert 的 batch 维度是固定的（静态形状才能 jit / shard），多出来的 token 没地方塞。
+
+    Switch Transformer / GShard 的做法是给每个专家预设一个"容量上限" `capacity = capacity_factor × (tokens / E)`，超过容量的 token 直接丢掉不算（capacity drop），把信号让 residual stream 接住。`capacity_factor` 越大丢得越少但浪费的预留算力越多，1.0 是最紧的设置，1.25 是一种常见的留余地。Mixtral 选择不设 capacity drop，让每个 expert 接所有路由给它的 token，靠 sparse dispatch 处理形状变化；Grok-1 的 `TransformerConfig` 留了字段但代码里没用，推理路径上也属于"无 cap"的同款路线。
 
 推理时如果**不 drop**（Grok-1 的做法），所有 token 都被 expert 处理。这看起来"更完整"，但和训练时的行为不一致 - 训练时 5% 的 token 习惯了走 residual，推理时这部分 token 变成走 expert，分布偏移。
 

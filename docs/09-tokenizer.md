@@ -9,6 +9,11 @@
 格式：SentencePiece
 大小：2229219 bytes
 词表大小：131072 (= 128 × 1024 = 2^17)
+
+!!! note "SentencePiece"
+    Google 开源的 subword tokenizer 库，从语料训练出一张词表，然后把任意输入字符串切成词表里的 piece。它的特点是不依赖语言的"空格分词"前处理 - 直接把整段文本（含空格、换行、标点）当 Unicode 字节流喂进去，所以中文、日文这种不靠空格分词的语言也能用同一套流程。空格在内部被替换成特殊符号 `▁`（U+2581），解码时再换回来。
+
+    存档格式是个 protobuf 文件（`.model`），里面打包了词表、合并规则、归一化设置等。Grok-1 的 `tokenizer.model` 就是这种 protobuf，2.2 MB，131072 个 piece。LLaMA-2、Mistral、Grok-1 都用 SentencePiece；LLaMA-3、GPT-4o 改用 tiktoken，两者格式互不兼容。
 ```
 
 实测（用 `sentencepiece==0.2.0` 加载）：
@@ -43,6 +48,13 @@ eos_token=2,
 **没有显式 BOS 处理** - run.py 里的示例 prompt 直接传给 tokenizer.encode，没有手动加 BOS。这是研究示例的简化做法。
 
 ## 9.2 BPE vs Unigram
+
+!!! note "BPE（Byte-Pair Encoding）与 Unigram"
+    两种主流的 subword 分词算法。BPE 走"自底向上合并"：先把所有文本拆成单字符，统计相邻字符对的出现频率，把最高频的一对合并成一个新 piece，再统计、再合并，循环到词表达到目标大小。最终切词时按训练时记下的合并顺序应用，每次贪心 merge。GPT-2、LLaMA、Mistral 用的都是 BPE。
+
+    Unigram 走"自顶向下淘汰"：先生成一个超大候选词表（含所有 1~3 字符子串），训练一个 unigram 语言模型给每个 piece 估个概率，每轮 EM 把"如果删掉对总语料 likelihood 影响最小"的那批 piece 砍掉，直到词表收敛到目标大小。切词时找让整句概率最大的切分，是全局最优而不是贪心。
+
+    Grok-1 的 131072 词表看起来是 Unigram（前 30 个 piece 没有 BPE 典型的"完整 256 个 byte token"段，倒像是预定义 `\n` × N、`\t` × N、数字 0-9 之后接学到的 piece）。LLaMA 系是 BPE，Grok-1 走 Unigram 路线在大模型里是少数派。
 
 SentencePiece 支持两种主要算法：
 
