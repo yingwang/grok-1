@@ -1,0 +1,88 @@
+site_name: Grok-1 中文精读
+site_description: xAI Grok-1 314B MoE 模型的逐行中文解析
+site_url: https://yingwang.github.io/grok-1/
+repo_url: https://github.com/yingwang/grok-1
+repo_name: yingwang/grok-1
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.tracking
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切换深色
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切换浅色
+  font:
+    text: Noto Sans SC
+    code: JetBrains Mono
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - footnotes
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+      toc_depth: 4
+
+extra_javascript:
+  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - 首页: index.md
+  - 第 1 章 引言: 01-intro.md
+  - 第 2 章 总体架构: 02-architecture.md
+  - 第 3 章 配置与超参: 03-config.md
+  - 第 4 章 model.py 精读·上 (RMSNorm/RoPE/Attention): 04-model-1.md
+  - 第 5 章 model.py 精读·中 (MoE 路由与专家): 05-model-2.md
+  - 第 6 章 model.py 精读·下 (Block 组装与切分): 06-model-3.md
+  - 第 7 章 checkpoint.py 权重加载: 07-checkpoint.md
+  - 第 8 章 runners.py 推理引擎: 08-runners.md
+  - 第 9 章 Tokenizer: 09-tokenizer.md
+  - 第 10 章 与其他 MoE 对比: 10-compare.md
+  - 第 11 章 工程教训与遗产: 11-lessons.md
