@@ -2,6 +2,8 @@
 
 [English](./README.md) | 简体中文
 
+> **[中文深度解析 / Chinese deep-dive analysis](https://yingwang.github.io/grok-1/)** - 11 章逐行精读 `model.py` / `runners.py` / `checkpoint.py`，含 MoE 路由细节、314B 参数账、与 Mixtral / DeepSeek-V2 / Qwen-MoE 的对比。
+
 本仓库包含用于加载和运行 **Grok-1** 开源权重模型的 JAX 示例代码。
 
 请确保下载模型检查点，并将 `ckpt-0` 目录放置于 `checkpoints` 目录下 —— 详见 [下载权重](#下载权重) 一节。

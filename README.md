@@ -2,6 +2,8 @@
 
 English | [简体中文](./README_zh.md)
 
+> **[Chinese deep-dive analysis / 中文深度解析](https://yingwang.github.io/grok-1/)** - 11 章逐行精读 `model.py` / `runners.py` / `checkpoint.py`，含 MoE 路由细节、314B 参数账、与 Mixtral / DeepSeek-V2 / Qwen-MoE 的对比。
+
 This repository contains JAX example code for loading and running the Grok-1 open-weights model.
 
 Make sure to download the checkpoint and place the `ckpt-0` directory in `checkpoints` - see [Downloading the weights](#downloading-the-weights)
