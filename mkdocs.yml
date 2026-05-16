@@ -9,11 +9,10 @@ theme:
   name: material
   language: zh
   features:
-    - navigation.tabs
-    - navigation.sections
     - navigation.top
     - navigation.indexes
     - navigation.tracking
+    - navigation.expand
     - toc.follow
     - content.code.copy
     - content.code.annotate
