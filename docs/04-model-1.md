@@ -591,6 +591,47 @@ if kv_memory:
 
     Grok-1 在 `Transformer.__call__` 里用 `jnp.tril(jnp.ones((1, 1, seq_len, seq_len)))` 直接构造一个下三角 mask，再和 padding mask 相乘得到最终 `[B, 1, T, T]` 的 mask。decode 阶段每步只有 1 个新 query，causal mask 退化成 [1, 1]，真正起作用的是 `memory_mask`（只允许 attend 到 cache 里已写入的位置）。
 
+### 4.4.1 mask 矩阵直观示意
+
+**prefill 阶段**（一次性处理整段输入 prompt），attention 的 logit 矩阵形状是 `[T, T]`，causal mask 是一个下三角矩阵：
+
+```text
+            K_0   K_1   K_2   K_3   K_4   K_5
+    Q_0  [   1     0     0     0     0     0  ]
+    Q_1  [   1     1     0     0     0     0  ]
+    Q_2  [   1     1     1     0     0     0  ]
+    Q_3  [   1     1     1     1     0     0  ]
+    Q_4  [   1     1     1     1     1     0  ]
+    Q_5  [   1     1     1     1     1     1  ]
+```
+
+矩阵里 `1` 的位置 attention 正常计算，`0` 的位置在 softmax 之前会被加上 `-1e30` 强行抹零。可以读出来 Q_i 只能 attend K_0..K_i 这一段历史，对应于"位置 i 的 token 生成时不能看到未来"这条因果约束。
+
+**decode 阶段**（自回归生成第 T+1 个 token），attention 矩阵退化成 `[1, T+1]` - 只有当前这一行需要算。KV cache 里已经存了过去 0..T 时刻所有 token 的 K/V，新 query Q_{T+1} 直接与整个 cache 做一次 `(1, T+1)` 的乘法。这时候 causal mask 已经简化成全 1 的 `[1, 1]` 矩阵（query 看自己当然允许），真正起作用的是 `memory_mask`，它由当前 batch 各样本的 `step` 计数器算出：`step` 之前的位置是有效 K/V，`step` 及之后的位置是没写入的 pad，必须屏蔽。
+
+```mermaid
+graph LR
+    Q["Q new<br/>位置 T+1 的 query"]
+    K0["K/V 位置 0"]
+    K1["K/V 位置 1"]
+    Kd["...已写入的中间位置..."]
+    KT["K/V 位置 T"]
+    PAD["K/V 位置 T+1..T_max<br/>未写入<br/>memory_mask 屏蔽"]
+    A["attention scores<br/>形状 1 x T+1"]
+    SM["softmax + value 聚合"]
+    O["attention output"]
+
+    Q --> A
+    K0 --> A
+    K1 --> A
+    Kd --> A
+    KT --> A
+    PAD -. 0 mask .-> A
+    A --> SM --> O
+```
+
+这张图也解释了为什么 KV cache 一旦预分配出来（`[B, T_max, H_kv, d_h]`），剩下的 decode 步骤只是把 step 指针往前推、把对应位置的 K/V 写进去，cache 的总形状不变 - 这是 JAX 静态形状要求的工程妥协，第 6.6 节会再展开。
+
 ## 4.5 `MultiHeadAttention.__call__` 全程
 
 `model.py:720-911` 是 attention 主体。我们已经看过 RoPE + cache 部分（4.4），现在看 attention 本身的计算。

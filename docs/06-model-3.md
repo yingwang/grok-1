@@ -902,6 +902,45 @@ sharding = jax.tree_util.tree_map_with_path(
 
 `apply_rules` 函数（位于 `model.py:92-109`）会针对每一个参数路径依次尝试匹配规则列表，匹配成功时返回对应的 PartitionSpec。
 
+### 6.7.1 (1, 8) mesh 在一台 8 卡机器上长什么样
+
+Grok-1 默认在一台 8 卡 H100/A100 节点上运行，JAX 把这 8 个 GPU 组织成形状为 (1, 8) 的二维 mesh：第 0 维是 `data` 轴（长度 1，单机不切 batch），第 1 维是 `model` 轴（长度 8，所有模型参数沿这条轴切）。每个 GPU 在 mesh 上对应一个坐标 `(0, i)`，i 从 0 到 7。
+
+下面这张图展示了同一份 314B 参数和同一份 KV cache 是如何沿这 8 个 device 切开的：
+
+```mermaid
+graph TD
+    subgraph M["mesh shape 1 x 8, data 轴 model 轴"]
+        G0["GPU 0<br/>model_idx=0"]
+        G1["GPU 1<br/>model_idx=1"]
+        G2["GPU 2<br/>model_idx=2"]
+        G3["GPU 3<br/>model_idx=3"]
+        G4["GPU 4<br/>model_idx=4"]
+        G5["GPU 5<br/>model_idx=5"]
+        G6["GPU 6<br/>model_idx=6"]
+        G7["GPU 7<br/>model_idx=7"]
+    end
+
+    subgraph W["每张卡持有的权重切片"]
+        E["expert 维度 8 个 / 1 张卡<br/>每张卡放 1 个 expert 的 full FFN"]
+        H["hidden 维度沿 model 轴 1/8<br/>Linear 权重按列切"]
+        K["KV head 维度 8 个 / 1 张卡<br/>每张卡持 1 个 KV head 的 cache"]
+    end
+
+    G0 --> W
+    G7 --> W
+```
+
+具体的切分规则按张量种类不同：
+
+- **MoE 专家权重**（占总参 98%）：8 个专家正好对应 mesh 的 8 个 model shard，**每张卡持有完整的 1 个 expert** 的三个矩阵（`linear`、`linear_v`、`linear_1`），形状各 `(d, d_ffn) = (6144, 32768)`。这种"按专家切"的好处是路由阶段一旦确定某个 token 走哪 2 个专家，对应的 2 张卡就负责算这个 token 的 FFN，其他 6 张卡这一段时间空闲。但因为不同 token 走的专家不同，整体上 8 张卡仍然是均衡的。
+- **Attention 投影矩阵**（Q/K/V/output）：沿 hidden 维或 head 维切。Q 投影 `(d, H_q × d_h) = (6144, 6144)` 按列切成 8 份，每张卡持有 `(6144, 768)`，对应 6 个 Q 头；KV 投影 `(d, H_kv × d_h) = (6144, 1024)` 按列切，每张卡持有 `(6144, 128)`，对应 1 个 KV 头。
+- **KV cache**：`(B, T_max, H_kv, d_h) = (B, 8192, 8, 128)` 沿 `H_kv` 维切，每张卡持有 1 个 KV head 的 cache，形状 `(B, 8192, 1, 128)`。这样配合 attention 投影的切分（每张卡也只算 1 个 KV head 对应的 attention），cache 的读写完全本地，不需要跨卡通信。
+- **Embedding 矩阵**：`(V, d) = (131072, 6144)` 沿 hidden 维切，每张卡持有 `(131072, 768)`。decode 时需要 all-gather 拼回完整 `[B, V]` 的 logits。
+- **RMSNorm 的 scale 参数**：形状 `(d,)`，体积太小不切，每张卡都完整复制一份（partition spec 为 `None`）。
+
+整套切法的核心思想是：**让算力大的张量（FFN 矩阵）按 expert 切、让带宽敏感的张量（KV cache）按 head 切、让小张量直接全复制**。这样大部分前向计算都是本地完成，只有少数几个点（router 输出聚合、attention output 聚合、最终 logits 聚合）需要跨卡 collective 通信。具体每个聚合点用哪种 collective（all-reduce / reduce-scatter / all-gather），由 `with_sharding_constraint` 和 XLA 编译器共同决定。
+
 ## 6.8 整张表：所有 module 与参数名
 
 | Module | 参数路径 | shape | partition |
