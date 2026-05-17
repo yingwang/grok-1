@@ -2,6 +2,8 @@
 
 本章把 Grok-1 放进同代 MoE 的横向对照里看。覆盖 Mixtral 系、DeepSeek 系、Qwen-MoE。所有数字尽量来自各模型的公开技术报告或 HuggingFace config，未公开则注明。
 
+本章面向已经读完前 9 章的读者：你已经了解 Grok-1 内部的具体张量流转，现在需要的是一份"地图"，把 Grok-1 的每一项设计放进 2024-2025 年 MoE 发展的整体坐标系。每节都先列对照表，再展开为什么有这样的差异、差异在工程上意味着什么。如果你只是想快速翻阅，10.1 和 10.13 两个汇总表已经覆盖核心事实；想理解"为什么是这样"，再按节往下读。
+
 ## 10.1 速查总表
 
 | 模型 | 发布 | 总参 | 激活参 | 激活比 | 专家数 | top-k | 路由策略 | hidden | layers | head Q/KV | head dim | $d_{\text{ffn}}/\text{expert}$ | tokenizer 词表 | 上下文 |
@@ -26,6 +28,21 @@
     标准 MoE 里每个 token 只走路由器挑出来的几个 expert，剩下的不参与；但有些通用知识（基础语法、常识词汇）几乎所有 token 都需要，强行让路由器在每个 token 上都挑同一个 expert 又浪费容量。DeepSeek-V2 引入 shared expert：在路由的 N 个 expert 之外，额外放 1~2 个"每个 token 都必走"的专家，路由的 expert 专攻特化能力。
 
     Grok-1 没有 shared expert - 8 个 expert top-2 全部走路由。DeepSeek-V2 是 160 routed + 2 shared，DeepSeek-V3 是 256 routed + 1 shared，Qwen-MoE 系列也用 shared expert。这是细粒度 MoE 路线的标配。
+
+!!! note "fine-grained expert（细颗粒专家）"
+    "细颗粒"与"胖"是同一根坐标轴的两端。胖专家路线（Grok / Mixtral）让单个 expert 的 FFN 中间维度保持在 1.4 万到 3.3 万的量级，每个 expert 自身就是一个"小型完整 FFN"；细颗粒路线（DeepSeek / Qwen-MoE）则把单个 expert 缩到中间维度 1.4K-2.5K，但同时把专家总数从 8 扩大到 60-256。
+
+    总参不变的前提下，"专家少而胖"与"专家多而瘦"在数学上可以等价（参数预算只是被切成 8 块还是切成 256 块的差别），但路由的语义不同：top-2 of 8 一共只有 $\binom{8}{2}=28$ 种激活组合，top-8 of 256 有 $\binom{256}{8} \approx 4 \times 10^{14}$ 种激活组合。组合空间大几个数量级，意味着模型在不同 token 上可以走非常不同的路径，专家之间形成的"特征分工"也更细。代价是路由器输出维度变大、负载均衡更难、稀疏调度的 kernel 实现更复杂。
+
+!!! note "MLA（Multi-head Latent Attention，多头潜在注意力）"
+    传统 MHA 给每个 head 各存一份完整的 K 和 V 向量，KV cache 总大小与 head 数成正比；GQA 让多个 Q head 共享同一组 KV，把 cache 缩小到 $H_{kv}/H_q$ 倍。MLA 走得更彻底：每个 token 在 cache 里只存一个**低维 latent 向量**（DeepSeek-V2 用 512 维），实际算 attention 时再用一组解压投影矩阵把 latent 还原成每个 head 的 K 和 V。cache 占用只跟 latent 维度有关，与 head 数完全解耦。
+
+    DeepSeek-V2 的 MLA 把 KV cache 压到 GQA 的约一半，DeepSeek-V3 沿用并进一步优化。代价是 attention 每一步要多算一次"latent → 各 head K/V"的解压，但解压矩阵很小，整体收益远大于代价。Grok-1 选择更传统的 GQA（48 Q : 8 KV），实现简单、与 LLaMA-2 / Mixtral 等同代模型的工具链一致，但在 8K 上下文之外的长序列推理上，cache 占用会成为明显瓶颈。
+
+!!! note "token-choice 路由 vs expert-choice 路由"
+    token-choice（token 选 expert）是最常见的写法：每个 token 让 router 打分，挑出分数最高的 k 个 expert 走。Grok-1、Mixtral、DeepSeek、Qwen-MoE 全部都是 token-choice。
+
+    expert-choice（expert 选 token）反过来：让每个 expert 自己挑出"我最想处理的" T 个 token。这种写法天然保证每个 expert 拿到的 token 数都是 T，不需要任何 aux loss 就能做到完美负载均衡。Google 在 2022 年的 expert-choice 论文里提出过，少数 Pathways 内部模型使用，但因为它打破了"每个 token 的算法行为对称"这一前提（同一个 batch 里有些 token 可能完全不被任何 expert 选中），主流开源 MoE 都没有采用。本书后续仍以 token-choice 为默认假设。
 
 ### 10.1.1 怎么读这张表
 
@@ -69,6 +86,15 @@ Grok-1 是胖专家派里最极端的：单 expert 0.6 B 参数 - 比 LLaMA-2 7B
 3. **MoE 的"稀疏优势"不大**（86 / 314 = 27% 激活比，比 DeepSeek-V3 的 5.5% 高得多）
 
 第 11 章会进一步分析：xAI 选择这条路线，可能与时间约束直接相关 - 2023 年中段细粒度 MoE 的工程实现尚不成熟，相关的负载均衡 loss 与稀疏调度技术也还在快速演进中，先用结构最简单、训练最可控的胖专家设计完成一次完整的 300 B 级训练，是更稳妥的工程选择。
+
+### 10.2.1 一张图理解两条路线的几何含义
+
+把"专家粒度"映射到几何空间里看会更直观。假设语义空间是一个高维球面，每个 token 在某一层的"语义身份"对应球面上的一个点。
+
+- **胖专家路线**把球面切成 8 个大瓣，每个瓣由一个胖 expert 负责。Top-2 路由的含义是"这个 token 落在两个瓣的交界处，需要两个 expert 的混合"。瓣的边界粗、表达分辨率受限于 8 个瓣的几何关系
+- **细颗粒路线**把球面切成 256 个小瓣，每个瓣由一个瘦 expert 负责。Top-8 路由意味着"用 8 个小瓣的线性组合来逼近这个 token 的语义点"。本质上更像分布式向量基（distributed basis）
+
+这个视角下，细颗粒路线相当于把 MoE 从"硬分配"走向"软分解"：单个专家的语义角色变得不再明确，取而代之的是一组协作专家在共同表示语义。这与稠密 FFN 的内部行为（一组 neuron 的线性组合）更接近，因此细颗粒路线的稀疏 MoE 在结构上更"像"一个被人为加上稀疏约束的稠密网络。这也解释了为什么细颗粒 MoE 的训练动力学更平滑、负载更易均衡，因为它没有强迫 router 在 8 个语义大类之间做硬选择。
 
 ## 10.3 路由策略对比
 
@@ -117,7 +143,17 @@ $$
 
 每个 expert 有一个**可学习的 bias** $b_i$，当某个 expert 被过度选用时，训练动态地降低它的 bias - 而不用任何额外 loss 项。这避免了 aux loss 与主 loss 的张力。
 
+!!! note "aux loss（辅助损失）"
+    标准 MoE 训练里，主 loss 是预测下一个 token 的交叉熵，但只用主 loss 训练会出现严重的"赢者通吃"现象：少数 expert 被反复挑中、其余 expert 完全得不到梯度更新，最终大部分专家退化成无用参数。aux loss（辅助损失）的目的是在主 loss 之外强加一项"负载均衡惩罚"，常见形式是计算"每个 expert 被选中的频率"与"每个 expert 在 softmax 后的平均权重"的乘积，鼓励两者都接近均匀分布。
+    
+    aux loss 的副作用是"分裂主 loss 的优化方向"：模型一方面要把 token 路由到最合适的 expert（语义最优），另一方面又要让负载平均（结构最优），两个目标常常打架，调权重很难。这就是 aux-loss-free 方案出现的动机 - 用直接调整 bias 的方式代替惩罚项，模型在训练过程中自动调整路由偏好以达到均衡，且不再扰动主 loss 的优化方向。
+
 Grok-1 在训练时不可能使用这一方法，原因是其训练发生在 2023 年，而 DeepSeek-V3 的 aux-loss-free 方案直到 2024 年底才正式公开发表。Grok-1 训练阶段大概率沿用了当时的标准做法 - 传统辅助损失（load-balance loss）加上 capacity factor 控制 - 但开源仓库中的推理代码没有保留训练侧的负载均衡逻辑，因此外界无法从仓库直接验证其训练时的具体配置。
+
+!!! note "capacity factor（容量因子）"
+    capacity factor 是 GShard / Switch Transformer 时代留下的工程概念。假设一个 batch 里有 $N$ 个 token，按 top-k 路由理论上每个 expert 平均会拿到 $Nk/E$ 个 token。但实际分布几乎不可能是均匀的，某些 expert 拿到的 token 数会显著超过平均值。capacity factor $c$ 定义"每个 expert 最多接收 $c \cdot Nk/E$ 个 token"，超出部分的 token 会被**drop**（直接跳过当前层、走残差直连，等价于这一层对该 token 无效）。
+    
+    Grok-1 的 model.py 里定义了 capacity factor 字段（具体是 `model.py` 的 TransformerConfig），但推理代码并未启用任何 drop 逻辑，所有路由结果都被完整执行。这种"字段保留但不使用"的写法多半是从训练代码里直接搬过来的，反映了训练侧曾经使用过 capacity 控制。
 
 ## 10.4 专家结构对比
 
@@ -131,6 +167,11 @@ Grok-1 在训练时不可能使用这一方法，原因是其训练发生在 202
 | Qwen-MoE | SwiGLU | SiLU | 1408 / 2560 |
 
 Grok-1 是唯一用 GeGLU 的（Gemma 也用 GeGLU，但 Gemma 是 dense）。SiLU vs GELU 在中间区段几乎相同，但尾部行为略有差异 - SiLU 在大负值有微小负输出，GELU 几乎 0。
+
+!!! note "GeGLU vs SwiGLU"
+    两者都是 GLU 家族变体，结构都是 $\text{down}(\text{act}(\text{up}_1(x)) \odot \text{up}_2(x))$，差别只在 act 选哪个：GeGLU 用 GELU $\big(x \cdot \Phi(x)\big)$，SwiGLU 用 SiLU $\big(x \cdot \sigma(x)\big)$，其中 $\Phi$ 是高斯累积分布函数、$\sigma$ 是 sigmoid。两者在主激活区域形状几乎一致，差异主要在尾部：SiLU 在大负值仍有微小负输出，GELU 在大负值几乎压到 0。
+    
+    Grok-1 的 expert FFN 中间维度 32768 是 Mixtral 8x22B 的 2 倍、DeepSeek-V2 routed expert 的 21 倍。从总参分配看，Grok-1 把绝大部分参数预算（约 309 B / 314 B）都投在 expert 的三个矩阵上，attention 部分相对很轻。这是胖专家路线的标志性几何特征。
 
 实际训练的最终效果差异通常很小，可在 loss 曲线上的影响往往被其他超参的噪声盖过。但**ckpt 不能跨激活函数互换** - 把按 SiLU 训出来的权重直接载入用 GELU 的 graph，GLU 那一支的几何含义已经变了，必须重训而不能简单移植。
 
@@ -155,6 +196,18 @@ MLA（Multi-Head Latent Attention）是 DeepSeek-V2 引入的全新方法 - 把 
     DeepSeek-V2/V3 用 MLA，latent 大约 512 维，相比 LLaMA-2 70B 那种 8 KV head × 128 dim = 1024 的 GQA cache 还能再省一倍以上。代价是 attention 算每一步多一次解压投影。Grok-1 用 GQA 48 Q : 8 KV（每个 token 在 cache 里存 8 × 128 = 1024 维 K + 同维 V），比 MLA 占用大，但实现简单，shard 起来直接。
 
 Grok-1 与 Mixtral 选择的是 GQA：实现简单、运行可靠、ckpt 在多卡之间切分时只需要按 head 维直接拆分，不涉及任何额外的解压投影。这种方案虽然在 KV cache 占用上不如 MLA，但工程门槛低、与既有训练 / 推理代码兼容性最好。
+
+### 10.5.1 KV cache 占用的实际计算
+
+把三种方案在 Grok-1 这种规模（64 层、batch 1、序列 8192）下的 KV cache 占用算清楚，差异会变得非常具体。所有数字按 bf16 (每个值 2 字节) 计算。
+
+- **MHA（假设 48 Q : 48 KV）**：$64 \times 8192 \times 2 \times 48 \times 128 \times 2 = 12.9 \text{ GB}$
+- **GQA（Grok-1 实际，48 Q : 8 KV）**：$64 \times 8192 \times 2 \times 8 \times 128 \times 2 = 2.15 \text{ GB}$
+- **MLA（按 latent = 512）**：$64 \times 8192 \times 512 \times 2 = 0.54 \text{ GB}$
+
+GQA 在 MHA 的基础上节省了 6 倍 cache，MLA 在 GQA 基础上再节省约 4 倍。把这些数字代到第 7 章的显存账里：Grok-1 八卡部署中，权重占用约 314 GB（int8）、KV cache 单 batch 仅约 2 GB，看起来 cache 占比很小。但**当上下文从 8K 扩到 64K、batch 从 1 扩到 32 时**，cache 会涨到 $2.15 \times 8 \times 32 = 550\text{ GB}$，超过权重本身。这就是为什么 DeepSeek 系列在主打长上下文与高吞吐推理的产品形态下必须用 MLA - GQA 在这种场景下会让 cache 直接撑爆显存。
+
+Grok-1 在 8K 上下文的硬限下，GQA 的 cache 占用问题被"按下不表"了；但反过来说，**正因为 cache 不可能放下更长上下文，xAI 也就没有必须切换到 MLA 的动力**。这是一种"短上下文 + 简单 cache 方案"自洽的设计闭环，但闭环之外的工程余地非常窄。
 
 ## 10.6 上下文长度
 
@@ -268,7 +321,67 @@ HuggingFace Hub 上虽然有 `xai-org/grok-1` 的官方 ckpt，但**始终没有
 
 总结起来，Grok-1 留给后续工作的技术遗产主要集中在 **"大词表 + attention logit soft-cap + GeGLU + sandwich norm"** 这四点：它们或者被 Gemma 2 等模型直接吸收，或者作为大词表潮流的早期范例被引用。除此之外，Grok-1 在 MoE 路由、专家粒度、稀疏部署等设计上的选择，都在后来的工作中被改写或替代，并没有形成持续影响力。
 
-## 10.11 一句话总结每个模型
+## 10.11 各家模型的细节速记
+
+接下来对每个模型展开一段说明，覆盖架构亮点、训练取向与工程选型，方便建立更具体的横向印象。
+
+### 10.11.1 Mixtral 8x7B
+
+Mistral 在 2023 年 12 月以磁力链方式发布的首个开源 MoE，是后续 MoE 讨论的事实基准。整体设计在当时极为节制：
+
+- hidden 4096、32 层、32 Q / 8 KV head，与 Mistral 7B（dense 基线）保持一致，等于"把 Mistral 7B 的 FFN 拆成 8 个 expert，其它都不变"
+- top-2 of 8 路由、SwiGLU FFN、SiLU 激活、RoPE base 调到 1e6 直接支持 32K 上下文
+- gate 在 top-k 之后重新归一化到 1，使 expert 输出量级稳定，便于训练
+- tokenizer 沿用 LLaMA-2 系列的 32K BPE 词表，没有扩词
+
+Mixtral 8x7B 的工程意义不在于它有多少创新，而在于它**第一次把"开源 MoE 可以与同尺寸稠密模型直接竞争"这件事打实**。它的存在直接定义了 Grok-1 进入开源生态时的对照基线。
+
+### 10.11.2 Mixtral 8x22B
+
+Mistral 在 2024 年 4 月发布的等比放大版本，与 Grok-1 公开时间相距仅一个月，配置高度相似：hidden 6144、48 Q / 8 KV、56 层、SwiGLU、top-2 of 8。差异主要在以下几点：
+
+- FFN 中间维度 16384，明显小于 Grok-1 的 32768，因此单 expert 参数约 0.3 B，是 Grok-1 单 expert 的一半
+- 总参 141 B、激活 39 B，激活比同为约 27%，但绝对算力门槛明显低于 Grok-1
+- RoPE base 1e6、上下文 65536，比 Grok-1 的 8K 长一个数量级
+- 32K BPE 词表沿用，没有像 Grok-1 那样上推到 128K+
+
+Mixtral 8x22B 与 Grok-1 几乎是同一类设计的两个不同尺寸点，可以视为胖专家路线在 2024 年初的标准答案。两者在配置上相似度极高这一事实，也旁证了"48 Q / 8 KV / hidden 6144"在 100-300 B 规模下确实是一个被多支团队独立发现的自然 sweet spot。
+
+### 10.11.3 DeepSeek-V2
+
+2024 年 5 月发布，是细粒度 MoE 路线第一份完整的公开实现：
+
+- 160 routed expert + 2 shared expert，top-6 路由，激活比仅约 8.9%
+- MLA 注意力，KV cache latent 维度 512，相对同级 GQA 节省约 4 倍 cache
+- 多种 aux loss 组合：device-balanced loss、communication-balanced loss、expert-balanced loss，分别针对设备、通信、专家三层面的不均衡施加惩罚
+- 训练 token 8.1 T，已经超过 Chinchilla 最优配比一倍，进入 over-training 区间
+
+DeepSeek-V2 第一次把"细粒度专家 + MLA + 精细 aux loss"组合为一个可复现的工程方案，并通过完整的技术报告把每一项的实现细节披露出来。它直接催生了 2024 年下半年开源 MoE 的范式转向。
+
+### 10.11.4 DeepSeek-V3
+
+2024 年 12 月发布，是细粒度路线的集大成之作：
+
+- 256 routed expert + 1 shared expert，top-8 路由，激活比降到 5.5%
+- aux-loss-free 路由（每个 expert 配可学习 bias，按使用频率自动调节），把负载均衡从 loss 项转为 bias 调节
+- MLA 注意力延续 V2 设计，KV cache 进一步减小
+- 671 B 总参 + 37 B 激活，训练 14.8 T token，FLOPs/token 仅为 Grok-1 的 43%
+- 国内自研训练栈 HAI-LLM，通信优化做到了 DualPipe 等专门为 MoE 设计的流水线方案
+
+DeepSeek-V3 在公开模型里把"总参越来越大、激活越来越小、训练 token 越来越多"这条三轴趋势推到了同期最远的位置。它在多项开源 base 评测上的成绩，是 Grok-1 这种胖专家路线在 2025 年之后明显失去吸引力的直接原因。
+
+### 10.11.5 Qwen-MoE 系列
+
+阿里通义实验室的 MoE 系列，从 2024 年 3 月的 Qwen1.5-MoE-A2.7B 起步，到 2025 年的 Qwen3-235B-A22B 共发布多个版本，呈现稳健的工程演进：
+
+- 早期版本沿用 shared expert 设计（4-8 个 shared + 60-64 个 routed），后期版本（Qwen3-235B）回归纯 routed
+- 词表 152K，对中英文混排场景的压缩率明显好于 LLaMA 系的 32K
+- GQA 比例从 1:1（Qwen1.5-MoE）逐步收紧到 7:1（Qwen2-57B-A14B），与同期主流保持一致
+- 训练栈基于阿里飞天体系与 Megatron-LM 改造，工程化程度高
+
+Qwen-MoE 没有 DeepSeek 那样的单点创新，但每一项设计都经过工业验证且配套工具链完整，是国内开源 MoE 路线中"稳健工程优先于研究激进"的代表。
+
+### 10.11.6 一句话总结
 
 - **Grok-1**：胖专家路线的极端代表，工程上以"先把模型完整训出来"为第一目标
 - **Mixtral 8x7B**：首个被社区广泛使用的开源 MoE 模型，为后续 MoE 工作建立了参照基准

@@ -10,6 +10,16 @@
 
 把这 200 行读懂，对 MoE 实现层的理解就基本完整了：路由器的精度选择、top-k 的实现方式、专家参数怎么组织、计算图怎么和 sharding 配合，这一章里都会落到具体代码上。
 
+!!! note "为什么读 MoE 实现这么难"
+    MoE 这个概念本身不复杂 - "router 选 k 个 expert，每个 token 走选中的 k 个"一句话能讲完。但实现起来有几个互相纠缠的难点，使得阅读源码门槛远高于稠密 FFN：
+
+    1. **形状变换密集**：原始输入 `[B, T, d]` 在 MoE 内部要经过 token 维 flatten 成 `[B*T, d]`、tile 成 `[B*T*k, d]`、按 expert 重排成 `[E, capacity, d]`、计算完再 scatter 回 `[B*T, d]`，每一步都有 shape 变化，不画图很难跟。
+    2. **稀疏 vs 密集的工程取舍**：理论上稀疏（每个 expert 只算分到它的 token）最省算力，但稀疏需要写自定义 scatter/gather kernel，对推理引擎复杂度的要求很高。Grok-1 选了"密集计算 + one-hot 选输出"的简化路径，代码好读但性能差 4 倍。Mixtral 选了 PyTorch 原生 `index_add_` 实现的"半稀疏"方案。真正高性能的实现（Megablocks、vLLM）用块稀疏 matmul 重写整个 kernel。
+    3. **参数布局非平凡**：8 个 expert 的 FFN 权重要么是 8 个独立 module（PyTorch 风格），要么是一个带 leading expert 维度的大张量（JAX/Haiku vmap 风格）。Grok-1 走的是后者，配合 `hk.experimental.transparent_lift` 这个不太常见的 API。
+    4. **训练损失项与推理代码分离**：MoE 训练要靠 aux loss 防止专家塌缩，但 aux loss 只在训练时存在，推理代码里看不到。读源码时容易误判"Grok-1 没有 aux loss" - 实际上是开源的推理代码没有，训练时几乎肯定用了。
+
+    本章会按"路由计算、专家参数布局、密集化 matmul、gate 加权"的顺序展开，每一节先把要解决的概念问题讲清楚，再贴代码。读起来不会太快，但读完应该能脱稿讲清楚 MoE 在 Grok-1 里到底怎么跑。
+
 ## 5.1 MoE 路由的总体流程
 
 先放一张图，再逐段精读。
@@ -128,6 +138,45 @@ inputs = jax.lax.convert_element_type(inputs, jnp.float32)
 
 输入先被 cast 到 fp32，然后整个路由计算（matmul + softmax）都在 fp32 下进行。这一点对 MoE 训练至关重要：如果在 bf16 下做路由，logit 的小数值差异会让同一个 token 在不同 step 被分发到不同 expert，专家拿到的 token 分布持续波动，最终导致训练发散。
 
+把 router 的数学写一遍会更直观。router weight 是 $W_r \in \mathbb{R}^{d \times E}$，对每个 token 的 hidden $x \in \mathbb{R}^d$ 算 logit：
+
+$$
+\ell = x W_r \in \mathbb{R}^{E}
+$$
+
+再做 softmax：
+
+$$
+p_i = \frac{\exp(\ell_i)}{\sum_{j=1}^E \exp(\ell_j)}, \quad i = 1, \dots, E
+$$
+
+top-k 从这 $E$ 个概率里选最大的 $k$ 个对应的 expert 索引和值：
+
+$$
+(\text{gate}_1, \dots, \text{gate}_k), (\text{idx}_1, \dots, \text{idx}_k) = \text{TopK}(p, k)
+$$
+
+对 Grok-1：$d = 6144$，$E = 8$，$k = 2$，所以 $W_r$ 形状是 `[6144, 8]`，参数量约 49152 个 fp32 数 = 192 KB。每层一份，64 层总共 12 MB - 占整个 314B 模型不到百万分之四的份额。router 之所以能"便宜"，就是因为这个 $d \times E$ 矩阵相对于 expert 的 $3 \cdot d \cdot d_{ffn} = 3 \cdot 6144 \cdot 32768 \approx 0.6\,\text{B}$ 实在小到可以忽略。
+
+PyTorch 里 Mixtral 的 router 实现：
+
+```python
+# transformers/models/mixtral/modeling_mixtral.py
+class MixtralSparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        ...
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        ...
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        ...
+```
+
+Mixtral 同样在 softmax 时显式指定 `dtype=torch.float`，保证 router 用 fp32 算。这是 MoE 实现里几乎不写在论文里、但所有人都默认要做的一件事。
+
 ### 5.2.2 没有 noisy gating，没有 z-loss
 
 Switch Transformer 论文里有"noisy top-k gating"：
@@ -190,6 +239,15 @@ Mixtral 论文里明确说他们用 B 派；Grok-1 代码直接告诉你它用 A
 
 这种"自带温度衰减"的行为很可能是 Grok-1 训练时的有意选择，让网络在路由不确定的情况下输出自动变小，从而对路由噪声更鲁棒。
 
+!!! note "为什么 router 用 softmax 而不是 sigmoid"
+    一个自然的疑问：既然只是想给每个 expert 打个分，为什么非要用 softmax 把它们归一化？直接对每个 logit 单独过 sigmoid、各自得到 0-1 区间的"激活强度"不也行吗？
+
+    答案在两层。第一层是**对比性**。softmax 强迫所有 expert 的概率之和为 1，这意味着提高一个 expert 的分数必然会降低其他 expert 的分数 - router 在做的是"竞争性选择"。sigmoid 则不然，所有 expert 可以同时被打 0.99 分，相互之间没有抑制。MoE 训练里我们希望 router 学会"对每个 token 挑出最合适的 expert"，这种"挑"本身就是竞争性的，softmax 更贴合这个语义。
+
+    第二层是**梯度信号**。softmax 的导数里包含所有 expert 之间的耦合 - 增大 $p_i$ 的同时会通过共享的归一化分母把梯度传给其他 $p_j$，让所有 expert 在反传时都拿到信号。sigmoid 各自独立，被选中的 expert 拿到正向梯度、其他 expert 完全不收到信号，长期下来未被选中的 expert 容易停滞不前。
+
+    后续也有少数研究尝试 sigmoid 路由（比如 Soft MoE），但 top-k 离散路由这条主线上 softmax 仍然是事实标准。Grok-1 与 Mixtral 都用 softmax，差别只在 "softmax 在 top-k 之前还是之后"。
+
 ## 5.3 `MoELayer._inference_call`：核心 200 行
 
 `model.py:293-397`。逐段精读。
@@ -232,6 +290,26 @@ def _inference_call(self, inputs: jax.Array, padding_mask: Optional[jax.Array] =
 3. 训练用的也是同一份实现，便于阅读和调试
 
 代价是计算成本接近真稀疏 MoE 的 4 倍（8 / 2 = 4）。
+
+!!! note "为什么真稀疏 MoE 需要自定义 kernel"
+    Token 选 expert 这一步是 **数据相关的稀疏**：哪些 token 走哪个 expert，runtime 才能知道。如果想"真正只算被分到的那些 token"，每个 expert 收到的 token 数都是动态的，对应的 matmul 形状也是动态的。
+
+    这个动态性和现代深度学习框架冲突：JAX/XLA 与 PyTorch 都要求 jit 编译时所有张量形状已知，动态形状会触发 recompile 或者 fallback 到 eager mode，性能大幅下降。解决方案有两类。一类是**预设固定 capacity**（Switch Transformer 路线）：每个 expert 最多接 $C = \text{capacity\_factor} \cdot T \cdot k / E$ 个 token，超过的丢弃，每个 expert 的形状回到静态的 `[C, d]`，能 jit 但有 drop 损失。另一类是**块稀疏 matmul**（Megablocks 路线）：把 token 按 expert 排成大块，所有 expert 拼成一个稀疏块矩阵，用专门写的 CUDA kernel 跑稀疏 matmul，没有 drop 也能跑满硬件。
+
+    Grok-1 把这两条路径都跳过，选最朴素的"全 expert 都算一遍、用 one-hot 选输出"，代价是 4 倍冗余计算，收益是不依赖任何自定义 kernel - 完全用标准 jnp.einsum 拼起来的代码，谁都能在 jax 0.4.25 上跑。对一个想"放出来给社区验证 ckpt 没问题"的开源项目，这个取舍是合理的。
+
+!!! note "对照 Mixtral 的半稀疏 PyTorch 实现"
+    Mixtral 走的是中间路线。它的 forward 里有这么一段：
+
+    ```python
+    for expert_idx in range(self.num_experts):
+        idx, top_x = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+        current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+    ```
+
+    每个 expert 单独跑一次，只处理 `torch.where` 挑出来的属于它的 token，最后 `index_add_` 把结果 scatter 回去。这是稀疏的，但每个 expert 都得单独 launch 一个 kernel - 在 batch×seq 很大时性能尚可，batch 小时会被 kernel launch 开销拖累。Megablocks 进一步把这 $E$ 个 matmul 融合成一个块稀疏 matmul，把 kernel launch 次数从 $E$ 降到 1。三种方案的取舍各有侧重，Grok-1 的密集化方案在三种里最简单也最慢。
 
 ### 5.3.2 专家参数的获取：transparent_lift + vmap
 
@@ -321,6 +399,27 @@ def moe_slow_matmul1(input, weight, scales, index, prob):
 
 注意 `prob` 参数没有被使用，这是接口上的预留，gate 加权是在外层另外完成的。
 
+!!! note "`one_hot` 选输出的等价 PyTorch 写法"
+    `one_hot_indices` 形状是 `[8, B*T*2]`，`all_expert_output` 形状是 `[8, B*T*2, d_ffn]`。它们的 einsum `"bm,bmn->mn"` 等价于：对每个 token 位置 m，把所有 expert 的输出按 one-hot 权重求和。因为 one-hot 在每个 m 上只有 1 个位置是 1、其他都是 0，求和结果等于"选出该 token 对应 expert 的那一份输出"。
+
+    PyTorch 里写法可以是：
+
+    ```python
+    one_hot = F.one_hot(index.reshape(-1), num_classes=8).T  # [8, B*T*2]
+    all_expert_output = torch.einsum("mk,bkn->bmn", input, weight)  # [8, B*T*2, d_ffn]
+    output = torch.einsum("bm,bmn->mn", one_hot.float(), all_expert_output)
+    ```
+
+    或者更直观但同样浪费的：
+
+    ```python
+    all_expert_output = torch.einsum("mk,bkn->bmn", input, weight)  # [8, M, d_ffn]
+    # 对每个 token 取它对应的那一片
+    output = all_expert_output[index, torch.arange(M)]  # [M, d_ffn]
+    ```
+
+    第二种写法用 advanced indexing，没有显式 one-hot 矩阵，但计算量完全一样 - 浪费的是前面那次"算了 8 倍输出"。Grok-1 选 one-hot + einsum 是因为它在 XLA 编译下更容易被融合成单个 kernel；PyTorch 的 advanced indexing 在某些版本下会触发额外的内存拷贝。
+
 ### 5.3.4 `moe_slow_matmul2`：FFN 下投影 + psum
 
 ```python
@@ -353,6 +452,13 @@ def moe_slow_matmul2(input, weight, scales, index, prob):
 3. **结尾增加了 `jax.lax.psum(output, axis_name="model")`**，原因是 d_ffn 被切分到多卡后，每个 device 计算出的 `all_expert_output` 只包含自己负责那段 d_ffn 的部分贡献，需要在 model 轴上做一次 all-reduce sum 把各 device 的部分结果加起来
 
 输出 shape 为 `[m=B*T*2, d]`。
+
+!!! note "`jax.lax.psum`：跨设备 all-reduce sum"
+    `psum` 是 JAX 里最常用的 collective 通信原语，对应 NCCL 里的 all-reduce sum。它在指定的 mesh 轴上对每张 device 的局部张量求和，结果广播回每张 device。
+
+    对照 PyTorch 的 `torch.distributed.all_reduce(tensor, op=ReduceOp.SUM)` - 同一件事，只是 PyTorch 的 all-reduce 是 in-place 修改 tensor、JAX 的 psum 是返回新张量（函数式风格）。
+
+    在张量并行的标准 megatron 切法里，下投影矩阵切了中间维度后必须配 all-reduce。直观理解：上投影把 `[d]` 投到 `[d_ffn]`、中间做激活、下投影把 `[d_ffn]` 投回 `[d]`。中间维度切分后，每张 device 只持有 `d_ffn / N` 个通道，下投影时每张 device 只能算出 `[d]` 的"部分贡献"，必须 all-reduce sum 把 N 张卡的部分贡献相加，才能得到完整的 `[d]` 输出。这是张量并行的固定套路，无论 dense FFN 还是 MoE FFN 都一样。
 
 ### 5.3.5 SwiGLU 装配 + gate 加权
 
@@ -420,6 +526,63 @@ $$
 
 从命名习惯上严格来说，这种结构属于 **GeGLU**，不属于 SwiGLU。
 
+把完整的 FFN 计算逐步展开，对应代码里的三次 matmul + 一次按位乘 + 一次激活：
+
+设输入 $x \in \mathbb{R}^d$，FFN 中间维 $d_{ffn} = 32768$，三个权重矩阵 $W_g, W_v \in \mathbb{R}^{d \times d_{ffn}}$（对应代码里的 `linear` 和 `linear_v`），$W_o \in \mathbb{R}^{d_{ffn} \times d}$（对应 `linear_1`）。
+
+**第一步：两路 up projection。**
+
+$$
+u = x W_v, \quad g = x W_g, \quad u, g \in \mathbb{R}^{d_{ffn}}
+$$
+
+代码里 `x = moe_slow_matmul1(..., linear_v, ...)` 算的是 $u$，`y = moe_slow_matmul1(..., linear, ...)` 算的是 $g$。
+
+**第二步：gate 分支过激活函数。**
+
+$$
+g' = \text{GELU}(g)
+$$
+
+代码里 `y = jax.nn.gelu(y)`。GELU 定义：
+
+$$
+\text{GELU}(z) = z \cdot \Phi(z)
+$$
+
+其中 $\Phi$ 是标准正态的累积分布函数（CDF）。直觉上 GELU 把 ReLU 的 "硬截断" 换成 "按 $z$ 的标准正态概率柔性 gate"，小负值会被部分保留（不像 ReLU 直接砍到 0），大正值几乎原样通过。
+
+**第三步：两路按位相乘，再过 down projection。**
+
+$$
+y = (u \odot g') W_o \in \mathbb{R}^d
+$$
+
+代码里 `out = moe_slow_matmul2(x * y, linear_1, ...)`，`x * y` 是 $u \odot g'$，`moe_slow_matmul2` 做 down projection。
+
+整个 FFN 的最终输出：
+
+$$
+\text{FFN}(x) = \big( (x W_v) \odot \text{GELU}(x W_g) \big) W_o
+$$
+
+PyTorch 里 LLaMA 的 SwiGLU 写法（FFN 三件套）：
+
+```python
+class LlamaMLP(nn.Module):
+    def __init__(self, config):
+        ...
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+```
+
+把 `nn.SiLU()` 换成 `nn.GELU()`、把 hidden/intermediate 改成 6144/32768，就是 Grok-1 单个 expert 的 FFN。Grok-1 的特殊性只有两点：8 个并列的 expert（PyTorch 里要么 8 个 `LlamaMLP` 实例、要么一个带 leading 8 维的大权重），以及用 GELU 而不是 SiLU。
+
 | 模型 | FFN 激活 |
 | --- | --- |
 | LLaMA-2 | SiLU (SwiGLU) |
@@ -439,6 +602,14 @@ out = jnp.sum(out, axis=2)
 ```
 
 每个 token 的两份 expert 输出按 gate 加权求和。这里的 `expert_gate` 来自 5.2.3 中讨论的 A 派实现：它是直接从 8 个 expert 的 softmax 概率里取出的 top-2 值，没有在 top-k 之后做归一化，所以两份 gate 的加权之和小于 1。
+
+写成数学公式：对每个 token，设它选中的两个 expert 是 $e_1, e_2$，对应 gate 是 $g_1, g_2$，两个 expert 的输出是 $\text{FFN}_{e_1}(x), \text{FFN}_{e_2}(x)$。最终 MoE 层的输出是：
+
+$$
+\text{MoE}(x) = g_1 \cdot \text{FFN}_{e_1}(x) + g_2 \cdot \text{FFN}_{e_2}(x)
+$$
+
+注意这是 A 派的写法，$g_1 + g_2 < 1$。Mixtral 的 B 派会在 top-k 之后做 $g_i \leftarrow g_i / (g_1 + g_2)$ 的归一化，确保 $g_1 + g_2 = 1$，输出量级稳定。Grok-1 不做归一化，等于让每层 MoE 输出按 $g_1 + g_2$ 缩放 - 这个值在路由很"硬"（接近 one-hot）时接近 1，在路由很"软"（接近均匀）时接近 0.25。残差通路上的稳定靠后面的 RMSNorm 兜底（参见 5.8）。
 
 ### 5.3.6 `else: return inputs`
 
@@ -533,6 +704,29 @@ Grok-1 推理代码里：
 
 所以 Grok-1 推理代码中"不 drop"的选择，可以理解为一种 inference-side 的近似处理。
 
+### 5.5.2 PyTorch 里实现负载均衡 loss 的方式
+
+如果你只读过 Grok-1 的推理代码，看不到 aux loss 的影子，可能会以为这一项可有可无。但 PyTorch 里 Mixtral 训练时实现的 aux loss 几乎是教科书式的，把它的写法摆出来对比一下：
+
+```python
+# transformers/models/mixtral/modeling_mixtral.py (简化版)
+def load_balancing_loss_func(router_logits, num_experts, top_k):
+    routing_weights = F.softmax(router_logits, dim=-1)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = F.one_hot(selected_experts, num_experts)        # [..., k, E]
+
+    # 每个 expert 拿到的 token 比例
+    tokens_per_expert = torch.mean(expert_mask.float(), dim=(0, 1))    # [E]
+
+    # 每个 expert 收到的 routing 概率平均
+    router_prob_per_expert = torch.mean(routing_weights, dim=(0, 1))   # [E]
+
+    aux_loss = num_experts * torch.sum(tokens_per_expert * router_prob_per_expert)
+    return aux_loss
+```
+
+这一段 loss 会按一个固定系数（典型 0.01）加到主 cross-entropy loss 上，反传时同时拉动 router 输出更平均。Grok-1 训练时几乎肯定有类似实现，只是没出现在开源推理代码里。
+
 ## 5.6 Sharding：expert 维度怎么切
 
 回看 partition rules（`model.py:142-149`）：
@@ -567,6 +761,15 @@ Grok-1 推理代码里：
 - 每张卡分别计算自己负责的 d_ffn 切片，最后通过 `psum` 在 model 轴上做 all-reduce 完成结果汇总
 
 这本质上是 **tensor parallel 在 MoE 场景下的朴素扩展**，并不是真正意义上的 expert parallel。
+
+!!! note "Expert Parallel vs Tensor Parallel"
+    MoE 有两种主流的并行切分方式，搞清楚它们的区别对理解 Grok-1 的设计选择很关键。
+
+    **Tensor Parallel (TP)**：把每个 expert 的权重沿 hidden 维度（或 d_ffn 维度）切到多张卡上，所有卡都持有所有 expert 的部分权重。每张卡看到完整的 token 流，但只算每个 expert 的一部分输出，最后通过 all-reduce 合并。优点是 routing 不涉及跨卡通信（每张卡都独立做完整 routing，结果完全一致），缺点是显存占用与 expert 数线性扩张 - 8 个 expert 比 1 个 dense FFN 多占 8 倍权重。
+
+    **Expert Parallel (EP)**：把 8 个 expert 分布到 8 张卡上，每张卡只持有 1 个 expert 的完整权重。每张卡看到的 token 流不同 - 必须通过 all-to-all 通信把每个 token 送到它对应 expert 所在的卡。优点是显存压力小（每张卡只存一个 expert 的权重），缺点是 routing 之后必须做一次 all-to-all，对网络带宽要求很高。
+
+    实际生产部署常常用 **EP + TP 混合**：先按 EP 切 expert（比如 8 个 expert 分 8 个 node），每个 node 内部再用 TP 切单个 expert 的权重（比如每个 node 4 卡 TP）。Grok-1 的开源代码只用了纯 TP，因为单节点 8 卡的硬件目标下 TP 已经够用，EP 的 all-to-all 通信反而会增加复杂度。如果要把 Grok-1 部署到多节点环境，几乎肯定需要改造成 EP+TP 混合。
 
 ## 5.7 与 Mixtral 8x7B 路由代码的具体对比
 

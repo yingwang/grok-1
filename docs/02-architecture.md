@@ -6,9 +6,28 @@
 
 Grok-1 是 **64 层 decoder-only transformer**，每一层把 FFN 子层换成 **8 个 SwiGLU 专家中 top-2 路由**的 MoE 块，其余部分（GQA 注意力、RoPE、RMSNorm、残差）与 LLaMA-2 同代设计基本一致。模型整体只接受 token 输入、输出 next-token logits，没有 cross-attention，没有 encoder。
 
+!!! note "decoder-only / encoder-decoder / encoder-only 三派"
+    Transformer 在 2017 年原始论文里是 encoder + decoder 的双塔结构，专门为机器翻译设计 - encoder 把源语言句子编码成一组上下文向量，decoder 一边自回归地生成目标语言，一边通过 cross-attention 看 encoder 输出。后续的研究把这套架构按"用一半还是用全部"分成三派：
+
+    - **encoder-only**：只保留 encoder，代表是 BERT。适合做分类、抽取、检索这种"输入完整文本，输出离散标签或向量"的任务。每个位置都能看到上下文（双向 attention），但天然不能做生成。
+    - **encoder-decoder**：保留双塔，代表是 T5、BART。适合输入到输出有明显语义差异的任务（翻译、摘要、问答）。
+    - **decoder-only**：只保留 decoder，去掉 cross-attention，代表是 GPT、LLaMA、Mistral、Grok。每个位置只能看到自己左边的 token（因果 attention），天然适合自回归生成 - 训练时用 next-token prediction loss，推理时一次吐一个 token。
+
+    2018 年以后的实证经验是：把 decoder-only scale 起来，加足够多数据，效果反超 encoder-decoder，且架构更统一（输入和输出共用一套 attention）。Grok-1 属于这一派。
+
+!!! note "next-token logits / autoregressive generation"
+    decoder-only 模型每一步的输出不是"下一个 token"，而是**整个词表上的概率分布**，技术上是一个长度为 $V$（词表大小，Grok-1 是 131072）的向量，叫做 **logits**（未归一化的 log 概率）。把 logits 过 softmax 才得到归一化概率，再用 sampling 策略（greedy、top-k、top-p、temperature）从中选出一个 token id 写回到输入末尾，下一步重复这个过程。这个"每次只产生一个 token、把它加回输入再算下一个"的循环就叫 autoregressive generation。
+
 但"基本一致"里藏着几个少见的设计选择，本章先列出来，后面的精读章节再细看：
 
 1. **GQA：48 Q 头对 8 KV 头**，比例为 6:1。同代的 LLaMA-2 70B 配置是 64 Q 头对 8 KV 头，比例为 8:1。Grok-1 在 GQA 的"压缩比"上比 LLaMA-2 略保守，每组 K/V 服务 6 个 Q 而不是 8 个，理论上保留了更多 attention 表达能力，但 KV cache 体积也相应增大了一点
+
+!!! note "KV cache（自回归推理里那块吃显存的东西）"
+    decoder-only 模型自回归生成时，第 $t$ 步算 attention 需要看 0..t-1 步的所有 key 和 value。如果每生成一个新 token 都从头重算一遍前面所有位置的 K/V，时间复杂度是 $O(T^2)$ 的，越生成越慢。
+
+    工程上的优化是把每一步算出的 K/V 缓存下来 - 这个缓存就叫 **KV cache**，shape 大致是 `(batch, num_layers, num_kv_heads, seq_len, head_dim)`。每生成一个新 token 只需要算这个 token 自己的 K/V，追加到 cache 末尾，attention 时 Q 是 1 个 token、K/V 是 cache 里全部历史。这样把生成时的 attention 从 $O(T^2)$ 降到每步 $O(T)$。
+
+    代价是 KV cache 本身要占显存：Grok-1 满 8192 上下文、bf16 精度下，单条序列的 KV cache 约 $2 \cdot 64 \cdot 8 \cdot 8192 \cdot 128 \cdot 2 \,\text{bytes} \approx 1.7\,\text{GB}$（2 是 K 和 V 各一份）。GQA 把 num_kv_heads 从 48（MHA）降到 8，cache 直接小了 6 倍。所以 GQA 主要的工程意义不是省参数，而是省 KV cache 显存 - 这一点在长上下文推理里特别关键。
 2. **每个 sub-layer 用了两次 RMSNorm**：进入子层之前做一次 pre-norm、子层输出加回 residual 之前再做一次 post-norm，两次 norm 把子层输入和输出都钳制住。这种布局被称为"sandwich norm"，与 Cohere Command R / Command R+ 的设计一致（`model.py:1056-1060`，下文 2.5 详述）
 
 !!! note "sandwich norm（pre + post 双 norm 布局）"
@@ -17,7 +36,19 @@ Grok-1 是 **64 层 decoder-only transformer**，每一层把 FFN 子层换成 *
     sandwich norm 把两者夹在一起：`y = x + LayerNorm(SubLayer(LayerNorm(x)))` - 进子层前 norm 一次（pre）、出子层加回 residual 前再 norm 一次（post）。两次 norm 把 residual 流和子层输出都钳住，深网络训练更稳。代价是每层多一次 RMSNorm 计算（在 314B 里几乎免费）。Grok-1 64 层 + 4 个 RMSNorm/层（attention pre/post + FFN pre/post），共 256 次 norm，是 Cohere Command R 同款选择。
 3. **embedding 用 sqrt(d) 量级放大**：token 查表得到 embedding 之后，整体乘以约 $\sqrt{6144} \approx 78.38$ 的常数；输出端 logits 再乘以 $1/\sqrt{3} \approx 0.577$。这一对乘法配合在一起，是 µ-Transfer / DeepNet 风格的"输入/输出 scale 控制"思路，目的是让训练时不同层的激活量级保持稳定
 4. **attention logit 用 `30 * tanh(x/30)` 软裁剪**：Q 和 K 点积、再除以 $\sqrt{d_h}$ 之后，attention logit 还要再经过一个 `30 * tanh(x/30)` 的软裁剪函数（`model.py:864-865`）。这个函数对小输入几乎是恒等映射，对大输入则平滑地饱和到 $\pm 30$，目的是防止 attention logit 在 bf16 下溢出导致 softmax 出 NaN
+
+!!! note "bf16 / fp16 / fp32 的取值范围"
+    GPU 上训练和推理常用三种浮点格式。**fp32** 是 32 位单精度，1 位符号 + 8 位指数 + 23 位尾数，取值范围约 $\pm 3.4 \times 10^{38}$，是 PyTorch 的默认 dtype。**fp16** 是 16 位半精度，1+5+10，范围只到 $\pm 6.5 \times 10^4$，超过就 inf - 这是早期混合精度训练经常炸的根本原因。**bf16**（Brain Float 16）也是 16 位，但分配是 1+8+7，指数位和 fp32 一样宽，范围同样到 $\pm 3.4 \times 10^{38}$，只是精度（尾数 7 位）比 fp16 还低一点。
+
+    现在大模型几乎都用 bf16 - 范围足够大避免溢出，精度低一点对训练影响不大。但即便是 bf16，softmax 的 $e^x$ 也只能容忍 $x < 88$ 左右；Grok-1 这套 `30 * tanh(x/30)` 软裁剪就是把 attention logit 钳在 30 以内，给 softmax 留足够安全裕量。
 5. **MoE 路由没有 auxiliary loss、没有 capacity drop**：路由器只做纯 softmax + top-2 的简单选择，没有 Switch Transformer / GShard 那样的 auxiliary load-balancing loss，也没有"专家容量超限就丢弃部分 token"的 capacity drop 机制。所有 token 一律走两个专家，路由实现因此非常简洁
+
+!!! note "auxiliary loss / capacity drop（MoE 训练里的两个"补丁"）"
+    MoE 训练时容易出现 **路由塌缩**：router 把绝大多数 token 都送给某一两个 expert，剩下的 expert 永远拿不到 gradient 因此学不到东西。为了对抗这种塌缩，Switch Transformer 在主任务 loss 之外再加一项 **auxiliary load-balancing loss**，把"router 对每个 expert 的平均分配概率"和"每个 expert 实际接到的 token 比例"两个向量做内积当惩罚项 - 越均匀这一项越小，loss 鼓励路由趋于均衡。
+
+    **capacity drop** 是更暴力的硬约束：先按"完美均衡"算出每个 expert 应该处理的 token 数（叫 capacity），用 capacity_factor 乘个 1.0-1.5 的余量；如果某个 expert 实际被分到的 token 数超过这个余量，多出来的 token 直接 **被丢弃**（这一步就跳过 FFN，hidden 直接走 residual）。
+
+    Grok-1 推理代码这两项都没有 - 推理时本来就不需要 aux loss，capacity drop 又会引入路由的 batch 间耦合（一个 token 走不走 expert 取决于同 batch 其他 token 的选择），增加推理复杂度。所以 Grok-1 推理实现里的所有 token 一律完整地走它被路由到的两个 expert。
 
 下面用一张数据流图把整体串起来。
 
@@ -77,7 +108,54 @@ graph TD
 - **Final RMSNorm**：64 层 decoder 全部跑完之后，再对最终的 hidden 做一次 RMSNorm，然后才进入输出投影
 - **\*output_multiplier_scale**：输出投影得到的 logits 整体乘以约 0.577 的常数，这个数等于 $1/\sqrt{3}$。它与开头的 embedding_multiplier_scale 配对，共同构成 µ-Transfer 风格的输入/输出量级控制
 
+!!! note "RMSNorm vs LayerNorm（少一项均值的归一化）"
+    传统 LayerNorm 的公式是 $\text{LN}(x) = \gamma \cdot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta$，需要算均值 $\mu$、方差 $\sigma^2$，还有可学习的 scale $\gamma$ 和 bias $\beta$。
+
+    **RMSNorm** 把均值这一步省掉，公式是 $\text{RMSNorm}(x) = \gamma \cdot \frac{x}{\sqrt{\frac{1}{d}\sum x_i^2 + \epsilon}}$。它假设 hidden 的均值大致已经是 0（深层网络里实证基本成立），所以不需要再减一次均值；也常去掉 bias $\beta$。计算量约为 LayerNorm 的 70%，效果几乎一样。
+
+    LLaMA、Mistral、Mixtral、Grok 全部用 RMSNorm。PyTorch 用户对照：HuggingFace transformers 里的 `LlamaRMSNorm` 实现的就是这个公式。
+
 这 8 个步骤是 Grok-1 推理时每个 token 都要走的"宏路径"。第 4-6 章会把每个步骤展开到代码级。
+
+### 2.2.2 从 PyTorch 视角看这条流水
+
+如果你熟悉的是 HuggingFace 风格的 PyTorch 实现，把上面的数据流"翻译"成 PyTorch 伪代码大概是这样：
+
+```python
+# PyTorch 风格的等价伪代码
+class GrokModel(nn.Module):
+    def __init__(self, cfg):
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d)
+        self.layers = nn.ModuleList([GrokLayer(cfg) for _ in range(cfg.L)])
+        self.final_norm = RMSNorm(cfg.d)
+
+    def forward(self, tokens):
+        h = self.embed(tokens)
+        h = h * cfg.embedding_multiplier_scale          # sqrt(d) 放大
+        for layer in self.layers:
+            h = layer(h)
+        h = self.final_norm(h)
+        logits = h @ self.embed.weight.T                # tied embedding
+        logits = logits * cfg.output_multiplier_scale   # 1/sqrt(3)
+        return logits
+
+class GrokLayer(nn.Module):
+    def forward(self, h):
+        # attention 子层，sandwich norm
+        attn_in = self.pre_attn_norm(h)
+        attn_out = self.attn(attn_in)                   # GQA
+        attn_out = self.post_attn_norm(attn_out)        # 关键：第二次 norm
+        h = h + attn_out
+
+        # MoE 子层，sandwich norm
+        moe_in = self.pre_moe_norm(h)
+        moe_out = self.moe(moe_in)                      # top-2 of 8
+        moe_out = self.post_moe_norm(moe_out)           # 关键：第二次 norm
+        h = h + moe_out
+        return h
+```
+
+JAX/Haiku 里同样的逻辑因为有 `pjit`、`shard_map`、`with_sharding_constraint` 这些显式 sharding 标注，写起来啰嗦得多。但**计算图本身和 PyTorch 完全一致** - 第 4-6 章把代码逐行展开时，可以随时回头对照这段伪代码确认"这一步对应的是哪个子模块"。
 
 ## 2.3 模型规模账：314B 到底从哪里来
 
@@ -112,6 +190,8 @@ def ffn_size(emb_size, widening_factor):
 | Output 投影 | $(H_q d_h, d) = (6144, 6144)$ | 37.7 M |
 | 合计 | - | **88.1 M** |
 
+每一行的参数量都用"两个维度相乘"算出来的：$(6144 \times 6144) / 10^6 = 37.7\,\text{M}$，$(6144 \times 1024) / 10^6 = 6.3\,\text{M}$。Q 和 K/V 之所以差 6 倍，正是 GQA 让 KV head 数从 48 降到 8 的直接结果。在传统 MHA 下 K/V 投影也是 $(6144, 6144)$，每层注意力的参数会从 88M 涨到约 151M，64 层就多出 4B 参数 - 对 KV cache 的影响则更显著（如本章 2.1 的 note 所述）。
+
 注意：Q/K/V 都有 bias（`with_bias=True` 是 `Linear` 的默认值，但 MHA 调用时显式 `with_bias=False`，见 `model.py:887` 的 `final_projection` 与 `_linear_projection` 中 `Linear(num_heads * head_size, with_bias=False, ...)` 的 `model.py:905`）。所以 attention 内部所有 Linear 都没 bias。
 
 **FFN（每个 expert 是一个 SwiGLU）：**
@@ -125,6 +205,8 @@ def ffn_size(emb_size, widening_factor):
 | linear_1 | $(32768, 6144)$ | 201.3 M |
 | 单 expert 合计 | - | **603.9 M** |
 | 8 个 expert | - | **4.83 B** |
+
+SwiGLU 的三块矩阵分工是：`linear_v` 把 hidden 升到中间维度做"值"分支、`linear (gate)` 同样升维但要过 SiLU 激活后当作"门"、两路按位相乘再用 `linear_1` 降回 hidden。三块矩阵每块的参数量都是 $6144 \times 32768 / 10^6 \approx 201\,\text{M}$。如果换成不带 gate 的传统 GELU FFN，只需要两块（升维 + 降维），但为了保持总参数相当，中间维度要相应放大 50%。这就是 SwiGLU "三块 × 中间维度乘 2/3" 设计的来源。
 
 **LayerNorm（RMSNorm）：** 每层 4 个 RMSNorm（attention pre/post + FFN pre/post，见 `model.py:137-140` partition rules 中的 `rms_norm` ~ `rms_norm_3`），每个 6144 个 scale，共 24576 参数 - 可忽略。
 
@@ -155,15 +237,29 @@ $$
 
 ### 2.3.4 为什么 widening_factor=8 而 SwiGLU 通常是 widening=2.67
 
-这是个看起来奇怪的细节。SwiGLU/GeGLU 的"中间维度"惯例是 $d_{\text{ffn}} \approx \frac{2}{3} \cdot 4 \cdot d = \frac{8}{3} \cdot d$，即 widening = 8/3 ≈ 2.67。Llama2 70B 的 hidden=8192、ffn=28672，正好 ratio = 3.5（略大于 8/3）。
+这是个看起来奇怪的细节，把推导走一遍就清楚了。
 
-Grok-1 的 widening_factor=8 看起来是 Llama2 的 3 倍。但 `ffn_size` 函数对它再乘 2/3，最终得到 $8 \cdot 6144 \cdot 2/3 = 32768$，是 $d=6144$ 的 5.33 倍。这比 SwiGLU 的 2.67 倍多了一倍。
+第一步，先把"标准"的中间维度算出来。Vaswani 2017 原始 Transformer 用 ReLU/GELU FFN，惯例是中间维度 = $4 \cdot d$（升维 4 倍再降回来）。
 
-为什么 Grok-1 选这么"胖"的 FFN？
+第二步，SwiGLU 比传统 FFN 多一块 gate 矩阵，参数从 2 块变 3 块。要让 SwiGLU 总参数与传统 FFN 保持相当，惯例是把中间维度乘 $\frac{2}{3}$：
 
-可能的解释是：**MoE 里每个 expert 只服务 1/4 的 token**（top-2/8 = 25% 概率激活），如果想让 expert"看到足够多 token 学到特征"，就需要让每个 expert 的容量更大、参数更多，否则容量浪费。胖 expert 路线在 Mixtral 8x22B 也能看到（widening = 32768 / 6144 ≈ 5.33... 不对，Mixtral 8x22B 是 16384 / 6144 ≈ 2.67，标准 SwiGLU）。
+$$
+d_{\text{ffn}}^{\text{SwiGLU}} = \frac{2}{3} \cdot 4 \cdot d = \frac{8}{3} \cdot d
+$$
 
-所以 Grok-1 比 Mixtral 8x22B 在 FFN 上更胖 - 这又一次印证"Grok-1 是胖专家派的极端"。
+即等效 widening ≈ 2.67。LLaMA-2 70B 的 hidden = 8192、$d_{\text{ffn}}$ = 28672，比值 28672 / 8192 = 3.5，略高于 8/3 但是同一量级。
+
+第三步，看 Grok-1。`widening_factor` 字段是 8，但 `ffn_size(d, w) = int(w \cdot d) \cdot 2 \,//\, 3`，所以最终 $d_{\text{ffn}}$：
+
+$$
+d_{\text{ffn}} = \lfloor 8 \cdot 6144 \rfloor \cdot \frac{2}{3} = 49152 \cdot \frac{2}{3} = 32768
+$$
+
+实际比值 = 32768 / 6144 ≈ **5.33**，是 LLaMA 同代标准（2.67-3.5）的 1.5 到 2 倍。
+
+为什么 Grok-1 选这么"胖"的 FFN？可能的解释是：**MoE 里每个 expert 只服务 1/4 的 token**（top-2 of 8 ≈ 25% 概率被选中），如果想让 expert "看到足够多 token 学到稳定特征"，就需要给每个 expert 更大的容量、更多参数，否则容量浪费。胖 expert 路线让模型在同样总参数下分布更集中、单 expert 表达能力更强。
+
+注意横向对比：Mixtral 8x22B 的 hidden 也是 6144，但 $d_{\text{ffn}}$ = 16384，比值 ≈ 2.67，仍然是标准 SwiGLU 配置。所以 Grok-1 比 Mixtral 8x22B 在 FFN 上更胖 - 这又一次印证 "Grok-1 是胖专家派的极端"。
 
 ## 2.4 与稠密 70B、Mixtral 8x7B 的参数账对比
 
@@ -240,6 +336,17 @@ y = x + LayerNorm(SubLayer(LayerNorm(x)))
 
 ## 2.6 Sharding 策略概览
 
+在进入代码之前先把概念厘清。**Sharding**（分片）就是把一个大张量沿某些维度切成几块，分别放到不同设备上，每个设备只持有自己的那一片。当后续算子（比如 matmul）需要"完整"张量时，框架会自动插入 collective 通信（all-gather、all-reduce、reduce-scatter 等）把数据汇合或重新分发。
+
+JAX 的 sharding 模型有三个基本概念：
+
+- **Mesh**：把物理设备组织成 N 维网格。Grok-1 单机 8 卡用 `(1, 8)` 形状的二维 mesh，第一个轴叫 `"data"`、第二个轴叫 `"model"`。同样 8 卡也可以摆成 `(2, 4)` - 1 行 8 列 vs 2 行 4 列只是 mesh 形状不同。
+- **PartitionSpec（缩写 `P`）**：声明一个张量的每一维"沿哪个 mesh 轴切"。`P("data", "model")` 表示张量第 0 维沿 data 轴切、第 1 维沿 model 轴切；`P(None, "model")` 表示第 0 维完整复制到每个 device、第 1 维沿 model 轴切。
+- **Sharding rule**：用正则匹配参数名，给每类参数指定 PartitionSpec。这避免了手动给每个权重都标注。
+
+!!! note "PyTorch 对照（torch.distributed.tensor.DTensor）"
+    PyTorch 2.0 后引入的 DTensor 和 JAX sharding 是几乎一一对应的：`DeviceMesh` 对应 JAX `Mesh`、`Shard(dim)` 对应 `P("axis_name")` 在某一维切、`Replicate()` 对应 `P(None)` 不切。最大差别是 PyTorch 的 sharding 需要在 `nn.Module` 构造时手动包一层，JAX 是用全局 rule 匹配名字自动应用。另一种 PyTorch 的玩法是 `FairScale` 或 `DeepSpeed` 的 tensor parallel，那些更接近"手写 all_reduce"的层级，没有 JAX 这种声明式抽象。
+
 `model.py:112-160` 的 `TRANSFORMER_PARTITION_RULES` 列出了每个权重的 partition 方案，分两轴 `data` / `model`。
 
 ```python
@@ -260,8 +367,10 @@ TRANSFORMER_PARTITION_RULES = [
 
 读法：
 
-- 元组前两个元素是路径正则，匹配参数名
+- 元组前两个元素是路径正则，匹配参数名（Haiku 的参数名是层次化的，比如 `language_model/decoder_layer_0/multi_head_attention/query/w`）
 - 元组最后是 `PartitionSpec`，指出每个张量维沿哪个 mesh 轴切
+
+举个具体例子：`("multi_head_attention", "(query|key|value)", "w")` 这条匹配的是 attention 子层里 Q/K/V 任一投影的权重（"w" 是 Haiku 给 Linear 层权重的默认名字）；对应的 `P("data", "model")` 表示输入维（第 0 维 = d = 6144）沿 data 轴切、输出维（第 1 维 = $H_q d_h$ 或 $H_{kv} d_h$）沿 model 轴切。在 Grok-1 的 `(1, 8)` mesh 下 data 轴只有 1 个 device，所以输入维其实不切，输出维被切成 8 份 - 每张卡持有 1/8 的 Q/K/V 投影权重。
 
 整体策略可以总结为：
 
@@ -278,6 +387,8 @@ TRANSFORMER_PARTITION_RULES = [
 `run.py:60` 给的 `local_mesh_config=(1, 8)`，即 1 × 8 = 8 个 device，全部都给 model 维。`between_hosts_config=(1, 1)` 表示单机。如果是 16 卡分两机，会变成 `local_mesh_config=(1, 8)` + `between_hosts_config=(1, 2)`。
 
 这种"全 model 不切 data"的策略，意味着 Grok-1 在 8 卡上跑的是**纯 tensor parallel** - 一个 batch 在所有卡上共享同一份计算图，但每张卡只保留一部分参数和激活。和 dense 模型在 8 卡上做 tensor parallel 的拓扑几乎一样。
+
+这个选择背后的工程逻辑：314B 总参在 bf16 下约 628GB，在 int8 量化下约 314GB，单卡 H100 80GB 装不下；必须把权重切到多卡。但 8 卡的总和（640GB）只比 int8 后的权重多了一倍 - 把 batch 再切几份做 data parallel 已经没有显存余地。所以 mesh 形状被显存上限锁死成 `(1, 8)`，这是个被硬件而非算法决定的取舍。
 
 !!! note "tensor parallel / data parallel / model parallel"
     单机装不下的模型在多卡上有几种切法。**data parallel** 最简单：每张卡都有完整模型副本，把 batch 切几份让各卡同时算自己那份 micro-batch，最后 all-reduce 梯度 - 显存吃紧时根本用不了。**tensor parallel** 是把单个矩阵沿某一维切到多张卡上，每张卡只持有一部分 weight，forward 时 matmul 拆成多卡协作算，结果 all-gather 拼回来 - 显存压力小但通信频繁，对 NVLink 之类的高带宽互联很依赖。**model parallel** 是更宽的概念，pipeline parallel（按层切，一张卡跑前 16 层、另一张跑后 16 层）也算一种 model parallel。
